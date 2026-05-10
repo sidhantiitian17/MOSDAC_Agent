@@ -1,0 +1,19 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+.python-version
+
+# Downloaded files from crawler
+downloads/
+atlases_pdfs/
+
+
+# Virtual environments
+.venv
+
+# Environment variables (never commit)
+.env
