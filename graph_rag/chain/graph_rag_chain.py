@@ -1,14 +1,17 @@
 """LCEL chain: parallel-retrieve (graph + vector) -> format -> LLM -> string output."""
 from __future__ import annotations
 
+from pathlib import Path
+
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnableLambda, RunnableParallel
 
+from graph_rag.config import settings
 from graph_rag.llm.longcat_client import get_llm
 from graph_rag.retrieval.hybrid_retriever import HybridRetriever
 
-SYSTEM_PROMPT = """You are an expert assistant with access to a knowledge graph and document database.
+_DEFAULT_SYSTEM_PROMPT = """You are an expert assistant with access to a knowledge graph and document database.
 
 Use the provided context to answer the user's question accurately and concisely.
 
@@ -25,6 +28,14 @@ Rules:
 - Prefer relationship-based reasoning when graph paths are present.
 """
 
+
+def _load_system_prompt() -> str:
+    """Load system prompt from file. Falls back to default if file not found."""
+    path = Path(settings.system_prompt_path)
+    if path.exists():
+        return path.read_text(encoding="utf-8").strip()
+    return _DEFAULT_SYSTEM_PROMPT
+
 HUMAN_TEMPLATE = """{history}{question}"""
 
 
@@ -33,9 +44,11 @@ def build_graph_rag_chain(retriever: HybridRetriever | None = None, llm=None):
     retriever = retriever or HybridRetriever()
     llm = llm or get_llm()
 
+    system_text = _load_system_prompt()
+
     prompt = ChatPromptTemplate.from_messages(
         [
-            ("system", SYSTEM_PROMPT),
+            ("system", system_text),
             ("human", HUMAN_TEMPLATE),
         ]
     )

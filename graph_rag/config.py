@@ -55,6 +55,14 @@ class Settings(BaseSettings):
     top_k_graph: int = 10
     graph_depth: int = 2
 
+    # Local Qwen LLM (Ollama or vLLM — OpenAI-compatible endpoint)
+    qwen_api_base: str = "http://localhost:11434/v1"
+    qwen_model: str = "qwen2.5vl:7b"
+    qwen_api_key: str = "ollama"
+
+    # System prompt file path (change this to reconfigure LLM behaviour)
+    system_prompt_path: str = "./prompts/system_prompt.txt"
+
     def source_folders(self) -> list[Path]:
         return [Path(self.downloads_dir), Path(self.atlases_dir)]
 
