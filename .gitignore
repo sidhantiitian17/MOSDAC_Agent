@@ -10,10 +10,21 @@ wheels/
 # Downloaded files from crawler
 downloads/
 atlases_pdfs/
-
+.claude
 
 # Virtual environments
 .venv
 
 # Environment variables (never commit)
 .env
+
+# Vector DB persistence
+chroma_db/
+
+# pytest
+.pytest_cache/
+.coverage
+
+# IDE
+.vscode/
+.idea/
