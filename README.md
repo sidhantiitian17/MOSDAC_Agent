@@ -33,7 +33,7 @@ This repository provides a modular AI assistant platform with:
 
 ## Key Features
 
-## 1) Graph RAG pipeline
+### 1) Graph RAG pipeline
 
 - Loads source documents (HTML/PDF)
 - Splits into chunks
@@ -41,14 +41,14 @@ This repository provides a modular AI assistant platform with:
 - Extracts entity relations and stores triples in Neo4j
 - Performs hybrid retrieval (vector + graph context) for answering
 
-## 2) Chat API gateway
+### 2) Chat API gateway
 
 - Factory-based FastAPI composition (`create_app`)
 - `/chat` endpoint with conversation memory
 - Optional screenshot payload validation + multimodal response path
 - CORS, branding, and session backend configured via environment variables
 
-## 3) MOSDAC agent stack
+### 3) MOSDAC agent stack
 
 - Tool-backed order assistant:
   - search products
@@ -60,7 +60,7 @@ This repository provides a modular AI assistant platform with:
   - MCP transport mode
 - Optional `/mosdac/*` route mounting in the same FastAPI app
 
-## 4) MCP integration
+### 4) MCP integration
 
 - FastMCP server exposing MOSDAC tools
 - Supports `stdio` and `streamable-http` transport
@@ -89,7 +89,7 @@ This repository provides a modular AI assistant platform with:
 
 ## Setup
 
-## Prerequisites
+### Prerequisites
 
 - Python 3.11+ (project metadata currently specifies `>=3.13` in `pyproject.toml`)
 - Neo4j (for graph storage)
@@ -97,7 +97,7 @@ This repository provides a modular AI assistant platform with:
 - Optional: Ollama/local OpenAI-compatible endpoint for Qwen models
 - Optional: MOSDAC credentials for live ordering mode
 
-## Install
+### Install
 
 ```bash
 python -m venv .venv
@@ -105,7 +105,7 @@ source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -r requirement.txt
 ```
 
-## Configure environment
+### Configure environment
 
 ```bash
 cp .env.example .env
@@ -117,7 +117,7 @@ Then update required values in `.env` (API keys, Neo4j password, paths, model en
 
 ## Run Modes
 
-## A) Graph RAG CLI
+### A) Graph RAG CLI
 
 ```bash
 python main.py ingest   # run ingestion pipeline
@@ -125,7 +125,7 @@ python main.py chat     # interactive CLI chat
 python main.py test     # component smoke checks
 ```
 
-## B) FastAPI chat server
+### B) FastAPI chat server
 
 ```bash
 uvicorn chat_api.main:app --host 0.0.0.0 --port 8000 --reload
@@ -138,7 +138,7 @@ Primary endpoints:
 - `POST /chat`
 - `DELETE /chat/{session_id}`
 
-## C) Enable MOSDAC routes
+### C) Enable MOSDAC routes
 
 Set in `.env`:
 
@@ -153,7 +153,7 @@ Additional endpoints (default prefix `/mosdac`):
 - `POST /mosdac/chat`
 - `DELETE /mosdac/chat/{session_id}`
 
-## D) Run MCP server
+### D) Run MCP server
 
 ```bash
 python -m mosdac_agent.mcp_server
@@ -161,7 +161,7 @@ python -m mosdac_agent.mcp_server
 
 For HTTP transport, configure MCP settings in `.env` (`MCP_TRANSPORT=streamable-http`, host, port).
 
-## E) Optional mock backend and Streamlit UI
+### E) Optional mock backend and Streamlit UI
 
 ```bash
 python -m mosdac_agent.mock_mosdac
