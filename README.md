@@ -91,7 +91,7 @@ This repository provides a modular AI assistant platform with:
 
 ### Prerequisites
 
-- Python 3.11+ (project metadata currently specifies `>=3.13` in `pyproject.toml`)
+- Python 3.13+ (as declared in `pyproject.toml`)
 - Neo4j (for graph storage)
 - ChromaDB (local persistence directory)
 - Optional: Ollama/local OpenAI-compatible endpoint for Qwen models
