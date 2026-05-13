@@ -65,6 +65,7 @@ def create_app(
         service = ChatService(retriever=retriever, chain=chain, llm=llm, sessions=sessions)
 
     app.include_router(build_router(service))
+    _maybe_mount_mosdac(app, sessions)
     logger.info(
         "ChatAPI booted: title=%r origins=%s screenshot=%s",
         chat_api_settings.title,
@@ -72,6 +73,37 @@ def create_app(
         chat_api_settings.enable_screenshot,
     )
     return app
+
+
+def _maybe_mount_mosdac(app: FastAPI, sessions) -> None:
+    """Conditionally mount the MOSDAC agent router (/mosdac/*).
+
+    Heavy LLM / LangGraph imports happen only inside this function so existing
+    tests that rely on the pure-RAG path don't pay the cost. Enable per
+    deployment via env var ``MOSDAC_ENABLE_MOSDAC_ENDPOINT=true``.
+    """
+    try:
+        from mosdac_agent.config import mosdac_settings
+        if not mosdac_settings.enable_mosdac_endpoint:
+            return
+        from mosdac_agent.agent import AgentRunner, MosdacAgentService, build_agent
+        from mosdac_agent.routes import build_mosdac_router
+
+        if sessions is None:
+            sessions = build_session_store()
+        agent = build_agent()
+        runner = AgentRunner(
+            agent=agent,
+            recursion_limit=mosdac_settings.agent_recursion_limit,
+        )
+        service = MosdacAgentService(runner=runner, sessions=sessions)
+        app.include_router(build_mosdac_router(service))
+        logger.info(
+            "MOSDAC agent endpoints mounted under %s",
+            mosdac_settings.mosdac_route_prefix,
+        )
+    except Exception as exc:  # pragma: no cover  (fail-soft for missing optional deps)
+        logger.warning("MOSDAC endpoint not mounted: %s", exc)
 
 
 # Module-level singleton for uvicorn / Docker entrypoint.

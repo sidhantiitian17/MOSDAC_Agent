@@ -52,3 +52,14 @@ httpx>=0.27          # required by fastapi.testclient
 
 # Optional — pluggable session backend
 # redis>=5.0         # uncomment to enable CHAT_API_SESSION_BACKEND=redis
+
+# ── MOSDAC agent stack (mosdac_agent/*) ─────────────────────────────────────
+# Required for the LangGraph ReAct agent (in-process tools mode)
+langgraph>=0.2
+# Required for the MCP server entrypoint (python -m mosdac_agent.mcp_server)
+fastmcp>=2.5
+# Required only when AGENT_USE_LOCAL_TOOLS=false (agent talks MCP over HTTP)
+# langchain-mcp-adapters>=0.1
+# Optional UI prototype
+streamlit>=1.36
+requests>=2.31
