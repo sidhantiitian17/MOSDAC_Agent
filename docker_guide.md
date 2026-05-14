@@ -5,6 +5,15 @@ every service in this project using containers.
 No prior Docker knowledge is assumed.
 
 ---
+# Mode A — Ollama
+docker compose --profile ollama up
+docker exec mosdac_ollama ollama pull qwen2.5vl:7b   # first run only
+
+# Mode B — vLLM (downloads model ~14 GB on first start)
+docker compose --profile vllm up
+
+# Mode C — Cloud/external LLM (no GPU needed)
+docker compose up
 
 ## Table of Contents
 
