@@ -8,7 +8,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnableLambda, RunnableParallel
 
 from graph_rag.config import settings
-from graph_rag.llm.longcat_client import get_llm
+from graph_rag.llm.tabby_client import get_llm
 from graph_rag.retrieval.hybrid_retriever import HybridRetriever
 
 _DEFAULT_SYSTEM_PROMPT = """You are an expert assistant with access to a knowledge graph and document database.

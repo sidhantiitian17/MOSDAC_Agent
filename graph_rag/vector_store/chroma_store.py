@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import logging
-import time
 from pathlib import Path
 from typing import Iterable
 
@@ -72,39 +71,13 @@ class ChromaStore:
         new_ids = [i for i, _ in to_add]
         new_docs = [d for _, d in to_add]
 
-        import re as _re
-        for attempt in range(10):
-            try:
-                self._store.add_documents(documents=new_docs, ids=new_ids)
-                break
-            except Exception as exc:
-                exc_str = str(exc)
-                if "429" in exc_str or "RESOURCE_EXHAUSTED" in exc_str:
-                    # Daily quota exhaustion — retrying won't help today
-                    if "PerDay" in exc_str or "per_day" in exc_str.lower():
-                        raise RuntimeError(
-                            "Gemini daily embedding quota exhausted "
-                            "(1 000 RPD free tier). "
-                            "Re-run ingest after quota resets (midnight Pacific)."
-                        ) from exc
-                    m = _re.search(r"retry in (\d+)", exc_str)
-                    suggested = int(m.group(1)) if m else 30
-                    # Exponential buffer on top of API suggestion: 10, 20, 40, 80, 120…
-                    extra = min(10 * (2 ** attempt), 120)
-                    wait = suggested + extra
-                    logger.warning(
-                        "Rate limited (attempt %d/10); waiting %ds "
-                        "(API suggested %ds + %ds backoff buffer)",
-                        attempt + 1, wait, suggested, extra,
-                    )
-                    time.sleep(wait)
-                else:
-                    raise
-        else:
-            raise RuntimeError(
-                "Embedding API rate limited after 10 retries. "
-                "Daily quota (1 000 RPD) may be exhausted — "
-                "re-run ingest after quota resets (midnight Pacific)."
+        # BGE embeds locally — no HTTP 429, so no rate-limit retry loop needed.
+        # ChromaDB's Rust backend caps a single upsert at ~5461 items; batch defensively.
+        _BATCH = 5000
+        for start in range(0, len(new_docs), _BATCH):
+            self._store.add_documents(
+                documents=new_docs[start : start + _BATCH],
+                ids=new_ids[start : start + _BATCH],
             )
 
         logger.info("Indexed %d new chunks (skipped %d existing).", len(new_ids), len(docs) - len(new_ids))

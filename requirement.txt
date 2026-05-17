@@ -3,8 +3,6 @@ langchain>=0.3
 langchain-community>=0.3
 langchain-core>=0.3
 langchain-openai>=0.2
-langchain-google-genai>=2.0
-langchain-nvidia-ai-endpoints>=0.3
 langchain-text-splitters>=0.3
 langchain-chroma>=0.1
 langchain-neo4j>=0.1
@@ -12,7 +10,10 @@ langchain-neo4j>=0.1
 # LLM SDKs
 openai>=1.0
 anthropic
-google-genai
+
+# Local embeddings — BAAI/bge-small-en-v1.5 (offline; replaces Gemini + NVIDIA NIM)
+sentence-transformers>=2.7.0
+torch
 
 # Vector DB
 chromadb>=0.5
@@ -37,6 +38,9 @@ spacy>=3.7
 # Web framework (FastAPI gateway)
 fastapi>=0.100
 uvicorn[standard]>=0.23
+
+# Hybrid search — BM25 keyword ranking (Reciprocal Rank Fusion with vector search)
+rank-bm25>=0.2.2
 
 # Utilities
 python-dotenv

@@ -1,111 +1,37 @@
-version: "3.9"
-
 # ╔══════════════════════════════════════════════════════════════════════════════╗
-# ║  LLM BACKEND — pick ONE when starting:                                       ║
+# ║  MOSDAC GraphRAG — OFFLINE STACK                                             ║
 # ║                                                                              ║
-# ║  A) Ollama  (easy, pull-and-serve):                                          ║
-# ║       docker compose --profile ollama up                                     ║
-# ║       # first run only — pull the model:                                     ║
-# ║       docker exec mosdac_ollama ollama pull qwen2.5vl:7b                     ║
-# ║       Set in .env:  LLM_API_BASE=http://ollama:11434/v1                      ║
-# ║                     LLM_API_KEY=ollama                                        ║
+# ║  LLM:        Tabby ML runs as its OWN container, started separately.         ║
+# ║  Embeddings: BAAI/bge-large-en-v1.5 (1024-dim), from ./models_cache.         ║
+# ║  Graph:      Neo4j 5.18.0 with NEO4J_AUTH=none.                              ║
 # ║                                                                              ║
-# ║  B) vLLM  (production-grade, downloads model from HuggingFace):              ║
-# ║       docker compose --profile vllm up                                       ║
-# ║       Set in .env:  LLM_API_BASE=http://vllm:8000/v1                         ║
-# ║                     LLM_API_KEY=token-abc123  (any non-empty string)         ║
-# ║                     HF_TOKEN=hf_...  (HuggingFace token, gated models only) ║
-# ║       First run downloads ~14 GB; wait 5-15 min before chat_api is ready.   ║
+# ║  Start:   docker compose up --build                                          ║
 # ║                                                                              ║
-# ║  C) External / Cloud LLM  (no GPU needed):                                   ║
-# ║       docker compose up                                                       ║
-# ║       Set in .env:  LLM_API_BASE=https://api.yourprovider.com/v1             ║
-# ║                     LLM_API_KEY=your_api_key                                 ║
+# ║  Neo4j alternative (matches plan_offline.md verification) — run it           ║
+# ║  standalone instead of via this compose file:                                ║
+# ║    docker load -i neo4j_5.tar          # ISRO air-gapped only                ║
+# ║    docker run -d --name mosdac_graph_home -p 7474:7474 -p 7687:7687 \         ║
+# ║      -v D:\AI_agents\neo4j_data:/data -e NEO4J_AUTH=none neo4j:5.18.0         ║
+# ║  If you do that, run chat_api on the host with uvicorn rather than compose.   ║
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 
 services:
 
-  # ── LLM Backend A: Ollama ────────────────────────────────────────────────────
-  # Activated only with:  docker compose --profile ollama up
-  ollama:
-    profiles: [ollama]
-    image: ollama/ollama:latest
-    container_name: mosdac_ollama
-    restart: unless-stopped
-    ports:
-      - "11434:11434"
-    volumes:
-      - ollama_data:/root/.ollama
-    healthcheck:
-      test: ["CMD-SHELL", "ollama list > /dev/null 2>&1 || exit 1"]
-      interval: 15s
-      timeout: 10s
-      retries: 8
-      start_period: 30s
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              capabilities: [gpu]
-              count: all
-
-  # ── LLM Backend B: vLLM (model runs directly inside this container) ───────────
-  # Activated only with:  docker compose --profile vllm up
-  # Downloads the model from HuggingFace on first start (~14 GB for 7B).
-  # Override model with VLLM_MODEL in .env (default: Qwen/Qwen2.5-7B-Instruct).
-  vllm:
-    profiles: [vllm]
-    image: vllm/vllm-openai:latest
-    container_name: mosdac_vllm
-    restart: unless-stopped
-    ipc: host                   # vLLM requires shared memory for tensor parallelism
-    command:
-      - --model
-      - ${VLLM_MODEL:-Qwen/Qwen2.5-7B-Instruct}
-      - --served-model-name
-      - ${QWEN_MODEL:-qwen2.5:7b}
-      - --host
-      - "0.0.0.0"
-      - --port
-      - "8000"
-      - --max-model-len
-      - "${VLLM_MAX_MODEL_LEN:-8192}"
-      - --dtype
-      - "${VLLM_DTYPE:-auto}"
-    environment:
-      HUGGING_FACE_HUB_TOKEN: ${HF_TOKEN:-}
-    volumes:
-      - hf_cache:/root/.cache/huggingface
-    ports:
-      - "8001:8000"             # host 8001 → container 8000 (avoids clash with chat_api)
-    healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
-      interval: 30s
-      timeout: 15s
-      retries: 20
-      start_period: 300s        # model load can take several minutes
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              capabilities: [gpu]
-              count: all
-
   # ── Neo4j Knowledge Graph ────────────────────────────────────────────────────
   neo4j:
-    image: neo4j:2025.04.0-community
+    image: neo4j:5.18.0
     container_name: mosdac_neo4j
     restart: unless-stopped
     ports:
       - "7474:7474"
       - "7687:7687"
     environment:
-      NEO4J_AUTH: "neo4j/${NEO4J_PASSWORD}"
+      # Auth disabled — any creds the client sends (NEO4J_USERNAME / NEO4J_PASSWORD
+      # in .env) are ignored by the server.
+      NEO4J_AUTH: none
       NEO4J_server_memory_heap_max__size: "2G"
     volumes:
-      - neo4j_data:/data
+      - ./neo4j_data:/data        # bind mount — graph survives container recreation
       - neo4j_logs:/logs
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:7474 > /dev/null 2>&1 || exit 1"]
@@ -115,7 +41,6 @@ services:
       start_period: 60s
 
   # ── FastAPI Chat Gateway ─────────────────────────────────────────────────────
-  # Works with any LLM backend — controlled entirely by LLM_API_BASE in .env.
   chat_api:
     build:
       context: .
@@ -125,31 +50,29 @@ services:
     ports:
       - "8000:8000"
     env_file:
-      - .env
+      - .env                      # all settings AND credentials come from .env
     environment:
-      # Route chat_api to whichever LLM backend is active.
-      # Set LLM_API_BASE + LLM_API_KEY in .env to match your chosen profile.
-      QWEN_API_BASE: ${LLM_API_BASE:-http://ollama:11434/v1}
-      QWEN_API_KEY:  ${LLM_API_KEY:-ollama}
-      # Always reach Neo4j via its Docker service name, not localhost.
+      # Inside the compose network, reach Neo4j by its service name — overrides
+      # the bolt://localhost:7687 value carried in .env.
       NEO4J_URI: bolt://neo4j:7687
-    depends_on:
-      neo4j:
-        condition: service_healthy
-      ollama:
-        condition: service_healthy
-        required: false         # ignored when --profile ollama is not active
-      vllm:
-        condition: service_healthy
-        required: false         # ignored when --profile vllm is not active
+      # chat_api runs in a container; Tabby ML runs elsewhere. The .env value
+      # http://localhost:8080 is NOT reachable from inside the container, so
+      # override it here. Default assumes Tabby on the Docker host; for ISRO,
+      # set TABBY_BASE_URL_DOCKER in .env to Tabby's LAN address.
+      TABBY_BASE_URL: ${TABBY_BASE_URL_DOCKER:-http://host.docker.internal:8080/v1}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # lets the container reach host Tabby
     volumes:
       - ./chroma_db:/app/chroma_db
       - ./prompts:/app/prompts
+      - ./models_cache:/app/models_cache:ro   # pre-downloaded BGE model (offline)
       - ${DOWNLOADS_DIR:-./downloads}:/app/downloads:ro
       - ${ATLASES_DIR:-./atlases_pdfs}:/app/atlases:ro
+    depends_on:
+      neo4j:
+        condition: service_healthy
 
 volumes:
-  ollama_data:
-  hf_cache:
-  neo4j_data:
   neo4j_logs:
+  # neo4j_data is a host bind mount (./neo4j_data) — not a named volume.
+  # ollama_data and hf_cache removed — Tabby ML runs as a separate container.

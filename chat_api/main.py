@@ -55,7 +55,7 @@ def create_app(
     if service is None:
         # Lazy imports so tests can construct create_app() without LLM dependencies.
         from graph_rag.chain.graph_rag_chain import build_graph_rag_chain
-        from graph_rag.llm.qwen_client import get_llm
+        from graph_rag.llm.tabby_client import get_llm
         from graph_rag.retrieval.hybrid_retriever import HybridRetriever
 
         retriever = retriever or HybridRetriever()

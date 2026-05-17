@@ -14,10 +14,15 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 logger = logging.getLogger("graph_rag.main")
 
 
-def cmd_ingest() -> int:
+def cmd_ingest(argv: list[str] | None = None) -> int:
+    """Run ingestion. Flags: --skip-vector, --skip-graph"""
     from graph_rag.ingestion.pipeline import IngestionPipeline
 
-    pipeline = IngestionPipeline()
+    argv = argv or []
+    pipeline = IngestionPipeline(
+        skip_vector="--skip-vector" in argv,
+        skip_graph="--skip-graph" in argv,
+    )
     stats = pipeline.run()
     print(stats.summary())
     return 0 if not stats.errors else 1
@@ -53,9 +58,9 @@ def cmd_test() -> int:
 
     ok = True
     print("Checking configuration...")
-    print(f"  LONGCAT_MODEL          = {settings.longcat_model}")
-    print(f"  LONGCAT_API_BASE       = {settings.longcat_api_base}")
-    print(f"  GEMINI_EMBEDDING_MODEL = {settings.gemini_embedding_model}")
+    print(f"  TABBY_MODEL            = {settings.tabby_model}")
+    print(f"  TABBY_BASE_URL         = {settings.tabby_base_url}")
+    print(f"  BGE_MODEL_NAME         = {settings.bge_model_name}")
     print(f"  NEO4J_URI              = {settings.neo4j_uri}")
     print(f"  CHROMA_PERSIST_DIR     = {settings.chroma_persist_dir}")
     print(f"  DOWNLOADS_DIR          = {settings.downloads_dir}")
@@ -73,7 +78,7 @@ def cmd_test() -> int:
 
     print("\nChecking embedder...")
     try:
-        from graph_rag.embeddings.gemini_embedder import get_embedder
+        from graph_rag.embeddings.bge_embedder import get_embedder
 
         emb = get_embedder()
         vec = emb.embed_query("hello world")
@@ -85,7 +90,7 @@ def cmd_test() -> int:
     print("\nChecking ChromaDB...")
     try:
         from graph_rag.vector_store.chroma_store import ChromaStore
-        from graph_rag.embeddings.gemini_embedder import get_embedder
+        from graph_rag.embeddings.bge_embedder import get_embedder
 
         store = ChromaStore(embedder=get_embedder())
         print(f"  count = {store.count()}")
@@ -121,7 +126,7 @@ def cmd_test() -> int:
 
     print("\nChecking LLM...")
     try:
-        from graph_rag.llm.longcat_client import get_llm
+        from graph_rag.llm.tabby_client import get_llm
 
         llm = get_llm()
         resp = llm.invoke("Reply with just the word OK.")
@@ -141,7 +146,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     cmd = argv[0]
     if cmd == "ingest":
-        return cmd_ingest()
+        return cmd_ingest(argv[1:])
     if cmd == "chat":
         return cmd_chat()
     if cmd == "test":

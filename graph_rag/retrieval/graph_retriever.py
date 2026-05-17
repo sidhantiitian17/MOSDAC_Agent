@@ -2,7 +2,13 @@
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
+
+# Matches ALL-CAPS acronyms (≥2 chars: SAR, INSAT, AVHRR) and mixed-case proper
+# nouns (Oceansat, Resourcesat, INSAT-3D).  Used as fallback when the LLM
+# extractor returns nothing.
+_ENTITY_RE = re.compile(r"\b[A-Z][A-Z0-9\-]{1,}\b|\b[A-Z][a-z][a-zA-Z]*\b")
 
 from graph_rag.config import settings
 from graph_rag.knowledge_graph.extractor import EntityRelationExtractor
@@ -35,7 +41,8 @@ class GraphRetriever:
         names = [e[0] for e in ents]
         if names:
             return names
-        return [tok for tok in query.split() if tok and tok[0].isupper()]
+        # Fallback: regex-extract acronyms (SAR, INSAT) and proper nouns (Oceansat)
+        return list(dict.fromkeys(_ENTITY_RE.findall(query)))
 
     def retrieve(self, query: str) -> list[GraphPath]:
         try:

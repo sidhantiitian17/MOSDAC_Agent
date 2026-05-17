@@ -10,12 +10,54 @@ from graph_rag.config import settings
 
 logger = logging.getLogger(__name__)
 
+# pypdf emits WARNING-level logs for corrupt-but-loadable files (duplicate dict entries,
+# missing EOF markers). These are benign — real errors raise exceptions. Silence the noise.
+logging.getLogger("pypdf.generic._data_structures").setLevel(logging.ERROR)
+logging.getLogger("pypdf._reader").setLevel(logging.ERROR)
+
 PDF_SUFFIXES = {".pdf"}
 HTML_SUFFIXES = {".html", ".htm", ".xhtml"}
 TEXT_SUFFIXES = {".txt", ".md"}
 
 
+def _mute_fitz_stderr() -> None:
+    """Silence MuPDF C-level messages that go directly to stderr, bypassing Python logging."""
+    try:
+        import fitz
+        fitz.TOOLS.mupdf_display_errors(False)
+    except Exception:
+        pass
+
+
+def _has_fitz_format_errors(path: Path) -> bool:
+    """Open with fitz to detect format errors before attempting pypdf (~1ms check).
+
+    A corrupt PDF that fitz handles in ~2s can hang pypdf for 6+ minutes before it
+    gives up with EOF. Detecting corruption here saves that wasted wall-clock time.
+    """
+    try:
+        import fitz
+        _mute_fitz_stderr()
+        try:
+            fitz.TOOLS.mupdf_warnings(reset=True)  # clear accumulated warnings
+        except AttributeError:
+            return False  # older fitz without warning API — skip pre-check
+        with fitz.open(str(path)):
+            pass
+        try:
+            return bool(fitz.TOOLS.mupdf_warnings(reset=True))
+        except AttributeError:
+            return False
+    except Exception:
+        return True  # fitz couldn't even open it — definitely has errors
+
+
 def _load_pdf(path: Path) -> list[Document]:
+    # Fast pre-check: if fitz reports format errors, pypdf will hang on the same
+    # file for minutes. Skip it and go straight to the PyMuPDF recovery path.
+    if _has_fitz_format_errors(path):
+        logger.debug("Skipping pypdf for %s — fitz detected format errors", path.name)
+        return _load_pdf_pymupdf(path)
     try:
         from langchain_community.document_loaders import PyPDFLoader
         return PyPDFLoader(str(path)).load()
@@ -27,6 +69,7 @@ def _load_pdf(path: Path) -> list[Document]:
 def _load_pdf_pymupdf(path: Path) -> list[Document]:
     try:
         import fitz  # pymupdf
+        _mute_fitz_stderr()  # suppress C-level format error messages to stderr
         docs: list[Document] = []
         with fitz.open(str(path)) as pdf:
             for page_num in range(len(pdf)):
@@ -55,6 +98,7 @@ def _ocr_via_pymupdf(path: Path) -> list[Document] | None:
     """Render PDF pages with PyMuPDF and OCR each pixmap. Returns None if PDF won't open."""
     try:
         import fitz
+        _mute_fitz_stderr()
         import pytesseract
         from PIL import Image
         from graph_rag.config import settings as _settings

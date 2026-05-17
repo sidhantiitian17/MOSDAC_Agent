@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import logging
-import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -10,9 +9,6 @@ from tqdm.auto import tqdm
 
 from graph_rag.ingestion.loader import load_all_documents
 from graph_rag.ingestion.splitter import split_documents
-
-_EMBED_BATCH_SIZE = 50   # chunks per Gemini request batch
-_EMBED_BATCH_DELAY = 1.5  # seconds between batches to respect rate limits
 
 logger = logging.getLogger(__name__)
 
@@ -69,27 +65,14 @@ class IngestionPipeline:
         if not self.skip_vector:
             logger.info("Step 3/4 — embedding & storing in ChromaDB")
             try:
-                from graph_rag.embeddings.nvidia_embedder import get_embedder
+                from graph_rag.embeddings.bge_embedder import get_embedder
                 from graph_rag.vector_store.chroma_store import ChromaStore
 
                 store = ChromaStore(embedder=get_embedder())
-                total_indexed = 0
-                batch_errors = 0
-                for i in tqdm(range(0, len(chunks), _EMBED_BATCH_SIZE), desc="Embedding batches"):
-                    batch = chunks[i : i + _EMBED_BATCH_SIZE]
-                    try:
-                        added = store.add_documents(batch)
-                        total_indexed += len(added)
-                    except Exception as batch_exc:
-                        batch_errors += 1
-                        logger.warning("Batch %d/%d failed: %s", i // _EMBED_BATCH_SIZE + 1,
-                                       (len(chunks) + _EMBED_BATCH_SIZE - 1) // _EMBED_BATCH_SIZE,
-                                       batch_exc)
-                        stats.errors.append(f"batch {i}: {batch_exc}")
-                stats.chunks_indexed = total_indexed
-                if batch_errors:
-                    logger.warning("%d batches failed; re-run ingest to resume.", batch_errors)
-                logger.info("Indexed %d chunks into ChromaDB", total_indexed)
+                # BGE runs locally — no rate limits, so embed every chunk in one call.
+                added = store.add_documents(chunks)
+                stats.chunks_indexed = len(added)
+                logger.info("Indexed %d chunks into ChromaDB", len(added))
             except Exception as exc:
                 logger.exception("Vector indexing failed: %s", exc)
                 stats.errors.append(f"vector: {exc}")
@@ -114,14 +97,20 @@ class IngestionPipeline:
                         source_chunk_id=chunk.metadata.get("chunk_id", ""),
                         source_path=chunk.metadata.get("source", ""),
                     )
-                    for t in triples:
-                        neo4j.upsert_triple(t)
-                        entities_total += 2
-                        rels_total += 1
+                    if triples:
+                        neo4j.upsert_triples(triples)
+                        entities_total += 2 * len(triples)
+                        rels_total += len(triples)
                 neo4j.close()
                 stats.entities_created = entities_total
                 stats.relationships_created = rels_total
             except Exception as exc:
+                neo4j.close()
+                # KeyboardInterrupt hits a socket recv_into and gets masked by
+                # Neo4j's buffer cleanup raising BufferError on session __exit__.
+                # Detect via exception chain and re-raise so Ctrl+C aborts.
+                if isinstance(exc.__context__, KeyboardInterrupt):
+                    raise KeyboardInterrupt from exc.__context__
                 logger.exception("Knowledge graph build failed: %s", exc)
                 stats.errors.append(f"graph: {exc}")
         else:

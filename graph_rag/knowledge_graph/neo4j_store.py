@@ -57,7 +57,30 @@ class Neo4jStore:
             "  ON MATCH  SET r.confidence = CASE WHEN $confidence > coalesce(r.confidence, 0.0) THEN $confidence ELSE r.confidence END"
         )
         with self._driver.session(database=self._database) as session:
-            session.run(cypher, **triple.as_dict())
+            # Consume the result immediately — lazy consumption on session.__exit__
+            # causes a socket read against a potentially stale connection.
+            session.run(cypher, **triple.as_dict()).consume()
+
+    def upsert_triples(self, triples: list[Triple], batch_size: int = 200) -> None:
+        """Batch-upsert triples using UNWIND — one round-trip per batch of chunks."""
+        if not triples:
+            return
+        cypher = (
+            "UNWIND $rows AS t "
+            "MERGE (s:Entity {name: t.subject}) "
+            "  ON CREATE SET s.type = t.subject_type "
+            "  ON MATCH  SET s.type = coalesce(s.type, t.subject_type) "
+            "MERGE (o:Entity {name: t.object}) "
+            "  ON CREATE SET o.type = t.object_type "
+            "  ON MATCH  SET o.type = coalesce(o.type, t.object_type) "
+            "MERGE (s)-[r:RELATION {name: t.relation}]->(o) "
+            "  ON CREATE SET r.confidence = t.confidence, r.source_chunk_id = t.source_chunk_id, r.source_path = t.source_path "
+            "  ON MATCH  SET r.confidence = CASE WHEN t.confidence > coalesce(r.confidence, 0.0) THEN t.confidence ELSE r.confidence END"
+        )
+        rows = [t.as_dict() for t in triples]
+        for start in range(0, len(rows), batch_size):
+            with self._driver.session(database=self._database) as session:
+                session.run(cypher, rows=rows[start : start + batch_size]).consume()
 
     def query_neighbors(self, entity: str, depth: int | None = None) -> list[dict[str, Any]]:
         """Return paths up to `depth` hops away from any entity matching `entity` (case-insensitive)."""

@@ -6,12 +6,15 @@ dist/
 wheels/
 *.egg-info
 .python-version
+*.tar
 
 # Downloaded files from crawler
 downloads/
 atlases_pdfs/
 .claude
-
+models_cache/
+models--BAAI--bge-large-en-v1.5/
+neo4j_data/
 # Virtual environments
 .venv
 

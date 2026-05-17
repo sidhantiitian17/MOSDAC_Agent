@@ -9,6 +9,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Literal
 
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -36,10 +37,23 @@ class MosdacSettings(BaseSettings):
     mcp_transport: Literal["stdio", "streamable-http"] = "streamable-http"
     mcp_server_name: str = "mosdac-order-server"
 
-    # ── Agent / LLM ─────────────────────────────────────────────────────────
-    agent_llm_base_url: str = "http://localhost:11434/v1"  # Ollama OpenAI-compat
-    agent_llm_model: str = "qwen2.5:32b"
-    agent_llm_api_key: str = "ollama"
+    # ── Agent / LLM (Tabby ML — reuses TABBY_* from .env by default) ─────────
+    # Each field falls back to the shared TABBY_* var so the credential lives
+    # in .env exactly once. Set AGENT_LLM_* only to point the agent at an LLM
+    # different from the rest of the stack.
+    agent_llm_base_url: str = Field(
+        default="http://localhost:8080/v1",
+        validation_alias=AliasChoices("agent_llm_base_url", "tabby_base_url"),
+    )
+    agent_llm_model: str = Field(
+        default="Qwen2-1.5B-Instruct",
+        validation_alias=AliasChoices("agent_llm_model", "tabby_model"),
+    )
+    # Credential — never hardcoded. Resolved from AGENT_LLM_API_KEY or TABBY_API_TOKEN.
+    agent_llm_api_key: str = Field(
+        default="",
+        validation_alias=AliasChoices("agent_llm_api_key", "tabby_api_token"),
+    )
     agent_llm_temperature: float = 0.1
     agent_llm_num_ctx: int = 8192
     agent_use_local_tools: bool = True

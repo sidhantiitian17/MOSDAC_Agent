@@ -67,7 +67,7 @@ def _build_default_llm(settings: MosdacSettings):
         api_key=settings.agent_llm_api_key,
         base_url=settings.agent_llm_base_url,
         temperature=settings.agent_llm_temperature,
-        streaming=False,
+        streaming=True,  # Tabby ML requires streaming or calls time out
     )
 
 
