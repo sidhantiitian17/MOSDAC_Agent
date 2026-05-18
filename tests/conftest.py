@@ -1,6 +1,6 @@
 """Shared pytest fixtures.
 
-Tests that need live external services (Neo4j, Gemini, LongCat, ChromaDB writes)
+Tests that need live external services (Neo4j, Tabby ML, ChromaDB writes)
 are skipped automatically when the service isn't reachable, so the suite still
 runs cleanly in environments where only some pieces are wired up.
 """
@@ -42,26 +42,17 @@ def neo4j_available() -> bool:
 
 
 @pytest.fixture(scope="session")
-def nvidia_available() -> bool:
+def nomic_available() -> bool:
     try:
         from graph_rag.config import settings as s
 
-        if not s.nvidia_api_key or s.nvidia_api_key == "missing":
+        if not s.nomic_api_token:
             return False
-        from graph_rag.embeddings.nvidia_embedder import get_embedder
+        from graph_rag.embeddings.nomic_embedder import get_embedder
+
         get_embedder.cache_clear()
         get_embedder().embed_query("ping")
         return True
-    except Exception:
-        return False
-
-
-@pytest.fixture(scope="session")
-def longcat_available() -> bool:
-    try:
-        from graph_rag.config import settings as s
-
-        return bool(s.longcat_api_key) and s.longcat_api_key != "missing"
     except Exception:
         return False
 
@@ -71,11 +62,8 @@ def skip_if_no_neo4j(neo4j_available: bool):
         pytest.skip("Neo4j is not reachable — start a local instance to run this test.")
 
 
-def skip_if_no_nvidia(nvidia_available: bool):
-    if not nvidia_available:
-        pytest.skip("NVIDIA_API_KEY not configured or API unreachable.")
-
-
-def skip_if_no_longcat(longcat_available: bool):
-    if not longcat_available:
-        pytest.skip("LONGCAT_API_KEY not configured.")
+def skip_if_no_nomic(nomic_available: bool):
+    if not nomic_available:
+        pytest.skip(
+            "Tabby ML is not reachable or NOMIC_API_TOKEN / TABBY_API_TOKEN is not set."
+        )

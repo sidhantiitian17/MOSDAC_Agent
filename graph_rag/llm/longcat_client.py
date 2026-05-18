@@ -8,11 +8,10 @@ No code changes required.
 """
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 
 from langchain_openai import ChatOpenAI
-
-from graph_rag.config import settings
 
 
 @lru_cache(maxsize=1)
@@ -22,9 +21,9 @@ def get_llm(
     streaming: bool = False,
 ) -> ChatOpenAI:
     return ChatOpenAI(
-        model=settings.longcat_model,
-        api_key=settings.longcat_api_key,
-        base_url=settings.longcat_api_base,
+        model=os.getenv("LONGCAT_MODEL", "LongCat-Flash-Chat"),
+        api_key=os.getenv("LONGCAT_API_KEY", "missing"),
+        base_url=os.getenv("LONGCAT_API_BASE", "https://api.longcat.chat/openai"),
         temperature=temperature,
         max_tokens=max_tokens,
         streaming=streaming,
