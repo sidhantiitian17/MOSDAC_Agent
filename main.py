@@ -60,7 +60,8 @@ def cmd_test() -> int:
     print("Checking configuration...")
     print(f"  TABBY_MODEL            = {settings.tabby_model}")
     print(f"  TABBY_BASE_URL         = {settings.tabby_base_url}")
-    print(f"  BGE_MODEL_NAME         = {settings.bge_model_name}")
+    print(f"  NOMIC_MODEL_NAME       = {settings.nomic_model_name}")
+    print(f"  NOMIC_BASE_URL         = {settings.nomic_base_url}")
     print(f"  NEO4J_URI              = {settings.neo4j_uri}")
     print(f"  CHROMA_PERSIST_DIR     = {settings.chroma_persist_dir}")
     print(f"  DOWNLOADS_DIR          = {settings.downloads_dir}")
@@ -78,7 +79,7 @@ def cmd_test() -> int:
 
     print("\nChecking embedder...")
     try:
-        from graph_rag.embeddings.bge_embedder import get_embedder
+        from graph_rag.embeddings.nomic_embedder import get_embedder
 
         emb = get_embedder()
         vec = emb.embed_query("hello world")
@@ -90,7 +91,7 @@ def cmd_test() -> int:
     print("\nChecking ChromaDB...")
     try:
         from graph_rag.vector_store.chroma_store import ChromaStore
-        from graph_rag.embeddings.bge_embedder import get_embedder
+        from graph_rag.embeddings.nomic_embedder import get_embedder
 
         store = ChromaStore(embedder=get_embedder())
         print(f"  count = {store.count()}")

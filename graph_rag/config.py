@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -13,20 +14,6 @@ class Settings(BaseSettings):
         extra="ignore",
         case_sensitive=False,
     )
-
-    # LLM — LongCat (OpenAI-compatible, swappable to any local Docker model)
-    longcat_api_key: str = "missing"
-    longcat_model: str = "LongCat-Flash-Chat"
-    longcat_api_base: str = "https://api.longcat.chat/openai"
-    longcat_api_format: str = "openai"
-
-    # Embeddings — Gemini (kept for reference; no longer used by default)
-    gemini_api_key: str = "missing"
-    gemini_embedding_model: str = "models/gemini-embedding-001"
-
-    # Embeddings — NVIDIA NIM
-    nvidia_api_key: str = "missing"
-    nvidia_embedding_model: str = "nvidia/llama-nemotron-embed-1b-v2"
 
     # Neo4j
     neo4j_uri: str = "bolt://localhost:7687"
@@ -43,8 +30,8 @@ class Settings(BaseSettings):
     poppler_path: str = ""
 
     # Data source folders (HTML + PDF ingestion)
-    downloads_dir: str = "D:/AI_agents/downloads"
-    atlases_dir: str = "D:/AI_agents/atlases_pdfs"
+    downloads_dir: str = "./downloads"
+    atlases_dir: str = "./atlases_pdfs"
 
     # Chunking
     chunk_size: int = 800
@@ -57,23 +44,27 @@ class Settings(BaseSettings):
     top_k_bm25: int = 5
     hybrid_rrf_k: int = 60
 
-    # Local Qwen LLM (Ollama or vLLM — OpenAI-compatible endpoint)
-    qwen_api_base: str = "http://localhost:11434/v1"
-    qwen_model: str = "qwen2.5vl:7b"
-    qwen_api_key: str = "ollama"
-
-    # LLM — Tabby ML (offline, OpenAI-compatible — the active backend)
-    # tabby_api_token is a credential: keep the default empty and supply it via
-    # TABBY_API_TOKEN in .env. Never hardcode the token here.
+    # LLM — Tabby ML (OpenAI-compatible — active backend for both LLM and embeddings)
+    # Credentials must come from .env. Never hardcode the token here.
     tabby_base_url: str = "http://localhost:8080/v1"
     tabby_api_token: str = ""
     tabby_model: str = "Qwen2-1.5B-Instruct"
 
-    # Embeddings — BAAI/bge-large-en-v1.5 (offline, local — 1024-dim vectors)
-    bge_model_name: str = "BAAI/bge-large-en-v1.5"
-    bge_cache_dir: str = "./models_cache"
-    # When true, sentence-transformers loads only from bge_cache_dir (no network).
-    transformers_offline: bool = False
+    # Embeddings — Nomic Embed Text served by Tabby ML
+    # NOMIC_BASE_URL and NOMIC_API_TOKEN fall back to the shared TABBY_* values
+    # so a single Tabby ML instance serving both LLM and embeddings needs only
+    # one set of credentials in .env. Override with NOMIC_* to point at a
+    # separate embeddings server.
+    nomic_model_name: str = "nomic-embed-text"
+    nomic_base_url: str = Field(
+        default="http://localhost:8080/v1",
+        validation_alias=AliasChoices("nomic_base_url", "tabby_base_url"),
+    )
+    # Credential — never hardcoded. Resolved from NOMIC_API_TOKEN or TABBY_API_TOKEN.
+    nomic_api_token: str = Field(
+        default="",
+        validation_alias=AliasChoices("nomic_api_token", "tabby_api_token"),
+    )
 
     # System prompt file path (change this to reconfigure LLM behaviour)
     system_prompt_path: str = "./prompts/system_prompt.txt"

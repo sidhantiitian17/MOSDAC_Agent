@@ -9,20 +9,19 @@ Set in .env:
 """
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 
 from langchain_openai import ChatOpenAI
-
-from graph_rag.config import settings
 
 
 @lru_cache(maxsize=1)
 def get_llm(temperature: float = 0.2, max_tokens: int = 2048) -> ChatOpenAI:
     """Returns a ChatOpenAI instance pointed at the local Qwen endpoint."""
     return ChatOpenAI(
-        model=settings.qwen_model,
-        api_key=settings.qwen_api_key,
-        base_url=settings.qwen_api_base,
+        model=os.getenv("QWEN_MODEL", "qwen2.5vl:7b"),
+        api_key=os.getenv("QWEN_API_KEY", "ollama"),
+        base_url=os.getenv("QWEN_API_BASE", "http://localhost:11434/v1"),
         temperature=temperature,
         max_tokens=max_tokens,
         streaming=False,

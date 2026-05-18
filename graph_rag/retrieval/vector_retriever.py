@@ -20,7 +20,7 @@ class VectorHit:
 
 class VectorRetriever:
     def __init__(self, store: ChromaStore | None = None, k: int | None = None):
-        from graph_rag.embeddings.bge_embedder import get_embedder
+        from graph_rag.embeddings.nomic_embedder import get_embedder
 
         self._store = store or ChromaStore(embedder=get_embedder())
         self._k = k or settings.top_k_vector

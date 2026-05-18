@@ -65,11 +65,10 @@ class IngestionPipeline:
         if not self.skip_vector:
             logger.info("Step 3/4 — embedding & storing in ChromaDB")
             try:
-                from graph_rag.embeddings.bge_embedder import get_embedder
+                from graph_rag.embeddings.nomic_embedder import get_embedder
                 from graph_rag.vector_store.chroma_store import ChromaStore
 
                 store = ChromaStore(embedder=get_embedder())
-                # BGE runs locally — no rate limits, so embed every chunk in one call.
                 added = store.add_documents(chunks)
                 stats.chunks_indexed = len(added)
                 logger.info("Indexed %d chunks into ChromaDB", len(added))

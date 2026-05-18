@@ -71,7 +71,6 @@ class ChromaStore:
         new_ids = [i for i, _ in to_add]
         new_docs = [d for _, d in to_add]
 
-        # BGE embeds locally — no HTTP 429, so no rate-limit retry loop needed.
         # ChromaDB's Rust backend caps a single upsert at ~5461 items; batch defensively.
         _BATCH = 5000
         for start in range(0, len(new_docs), _BATCH):
