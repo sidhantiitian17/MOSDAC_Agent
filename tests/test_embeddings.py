@@ -1,4 +1,4 @@
-"""Tests for graph_rag/embeddings/nomic_embedder.py."""
+"""Tests for graph_rag/embeddings/ollama_embedder.py."""
 from __future__ import annotations
 
 import math
@@ -8,22 +8,25 @@ import pytest
 from tests.conftest import skip_if_no_nomic
 
 
-def test_embedder_requires_api_token(monkeypatch):
+def test_get_embedder_reads_url_from_settings(monkeypatch):
+    """get_embedder() must build the Ollama URL from settings, never hardcoded."""
     from graph_rag.config import Settings
+    from graph_rag.embeddings.ollama_embedder import OllamaEmbedder, get_embedder
 
-    s = Settings(_env_file=None, nomic_api_token="")
+    s = Settings(_env_file=None, ollama_base_url="http://sentinel-host:11434", ollama_embedding_model="bge-large")
     monkeypatch.setattr("graph_rag.config.settings", s, raising=False)
-
-    from graph_rag.embeddings import nomic_embedder
-
-    nomic_embedder.get_embedder.cache_clear()
-    with pytest.raises(ValueError, match="NOMIC_API_TOKEN"):
-        nomic_embedder.get_embedder()
+    get_embedder.cache_clear()
+    try:
+        emb = get_embedder()
+        assert isinstance(emb, OllamaEmbedder)
+        assert "sentinel-host" in emb._url
+    finally:
+        get_embedder.cache_clear()
 
 
 def test_embedder_returns_nonempty_vector(nomic_available):
     skip_if_no_nomic(nomic_available)
-    from graph_rag.embeddings.nomic_embedder import get_embedder
+    from graph_rag.embeddings.ollama_embedder import get_embedder
 
     get_embedder.cache_clear()
     emb = get_embedder()
@@ -35,7 +38,7 @@ def test_embedder_returns_nonempty_vector(nomic_available):
 
 def test_embed_documents_returns_correct_count(nomic_available):
     skip_if_no_nomic(nomic_available)
-    from graph_rag.embeddings.nomic_embedder import get_embedder
+    from graph_rag.embeddings.ollama_embedder import get_embedder
 
     get_embedder.cache_clear()
     emb = get_embedder()
@@ -47,7 +50,7 @@ def test_embed_documents_returns_correct_count(nomic_available):
 
 def test_similar_texts_have_higher_similarity(nomic_available):
     skip_if_no_nomic(nomic_available)
-    from graph_rag.embeddings.nomic_embedder import get_embedder
+    from graph_rag.embeddings.ollama_embedder import get_embedder
 
     get_embedder.cache_clear()
     emb = get_embedder()

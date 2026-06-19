@@ -17,12 +17,20 @@ models--BAAI--bge-large-en-v1.5/
 neo4j_data/
 # Virtual environments
 .venv
-
+venv/
 # Environment variables (never commit)
 .env
 
 # Vector DB persistence
 chroma_db/
+chroma_test_tmp*/
+
+# Incremental-ingestion manifests (runtime state)
+ingest_manifest.json
+drupal_ingestion_state.json
+
+# Generated eval output
+eval_results.md
 
 # pytest
 .pytest_cache/

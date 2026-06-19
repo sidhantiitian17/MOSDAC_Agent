@@ -9,11 +9,10 @@ langchain-neo4j>=0.1
 
 # LLM SDKs
 openai>=1.0
-anthropic
 
-# Local embeddings — BAAI/bge-small-en-v1.5 (offline; replaces Gemini + NVIDIA NIM)
-sentence-transformers>=2.7.0
-torch
+# Embeddings are served over HTTP — bge-large via Ollama (/api/embeddings) or
+# Nomic Embed Text via Tabby ML (/v1/embeddings). No local model weights are
+# loaded in-process, so torch / sentence-transformers are not required.
 
 # Vector DB
 chromadb>=0.5
@@ -30,6 +29,11 @@ Pillow>=10.0
 beautifulsoup4>=4.12
 lxml>=5.0
 unstructured>=0.14
+
+# ── Docling — primary structured PDF parser (Markdown + LaTeX math + OCR) ──────
+# Brings docling-core, docling-parse, docling-ibm-models, and a CPU onnxruntime.
+# OCR uses the system Tesseract installed in Dockerfile.api (no bundled engine).
+docling>=2.15
 
 # NLP — entity & relationship extraction
 spacy>=3.7
@@ -48,6 +52,7 @@ pydantic>=2.0
 pydantic-settings>=2.0
 tqdm
 typer>=0.12
+requests>=2.31
 
 # Testing
 pytest>=8.0
@@ -56,14 +61,3 @@ httpx>=0.27          # required by fastapi.testclient
 
 # Optional — pluggable session backend
 # redis>=5.0         # uncomment to enable CHAT_API_SESSION_BACKEND=redis
-
-# ── MOSDAC agent stack (mosdac_agent/*) ─────────────────────────────────────
-# Required for the LangGraph ReAct agent (in-process tools mode)
-langgraph>=0.2
-# Required for the MCP server entrypoint (python -m mosdac_agent.mcp_server)
-fastmcp>=2.5
-# Required only when AGENT_USE_LOCAL_TOOLS=false (agent talks MCP over HTTP)
-# langchain-mcp-adapters>=0.1
-# Optional UI prototype
-streamlit>=1.36
-requests>=2.31

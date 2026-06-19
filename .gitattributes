@@ -1,0 +1,7 @@
+# Normalize line endings to LF in the repo; Windows working copies stay CRLF.
+* text=auto eol=lf
+*.png binary
+*.pdf binary
+*.ico binary
+*.db binary
+*.sqlite3 binary

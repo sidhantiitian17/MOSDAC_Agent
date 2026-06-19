@@ -1,4 +1,4 @@
-"""Combine vector + BM25 keyword + graph retrieval into a single context block.
+﻿"""Combine vector + BM25 keyword + graph retrieval into a single context block.
 
 Vector and BM25 results are fused via Reciprocal Rank Fusion (RRF) before being
 formatted as the vector_context.  Graph context is assembled independently.
@@ -30,6 +30,14 @@ class HybridRetriever:
         self._vector = vector
         self._graph = graph
         self._bm25 = bm25
+        self._embedder = None  # lazy — only built when passage rerank is on
+
+    def _get_embedder(self):
+        if self._embedder is None:
+            from graph_rag.embeddings import get_embedder
+
+            self._embedder = get_embedder()
+        return self._embedder
 
     @property
     def vector(self) -> VectorRetriever:
@@ -88,23 +96,46 @@ class HybridRetriever:
             f"[Source: {h.source} | score={h.score:.4f}]\n{h.text}" for h in hits
         )
 
+    def _rerank_passages(self, query: str, hits: list[VectorHit]) -> list[VectorHit]:
+        """Embedding-rerank the fused candidate pool; keep the most relevant few."""
+        top = settings.top_k_passages
+        candidates = hits[: settings.rerank_candidate_pool]
+        if len(candidates) <= 1:
+            return candidates[:top]
+        try:
+            embedder = self._get_embedder()
+        except Exception as exc:
+            logger.debug("Passage rerank embedder unavailable: %s", exc)
+            return candidates[:top]
+
+        from graph_rag.retrieval._rank_utils import rerank_by_embedding
+
+        return rerank_by_embedding(query, candidates, lambda h: h.text, embedder, top)
+
     def retrieve(self, query: str) -> dict[str, str]:
+        # When reranking, pull a wider candidate pool from each source so the
+        # reranker has more to choose from; otherwise keep the default top-k.
+        rerank = settings.enable_passage_rerank
+        pool = settings.rerank_candidate_pool if rerank else None
+
         # Vector (semantic) hits
         try:
-            vec_hits = self.vector.retrieve(query)
+            vec_hits = self.vector.retrieve(query, k=pool)
         except Exception as exc:
             logger.warning("Vector retrieval unavailable: %s", exc)
             vec_hits = []
 
         # BM25 (keyword) hits
         try:
-            bm25_hits = self.bm25.retrieve(query)
+            bm25_hits = self.bm25.retrieve(query, k=pool)
         except Exception as exc:
             logger.warning("BM25 retrieval unavailable: %s", exc)
             bm25_hits = []
 
-        # Fuse with RRF then format
+        # Fuse with RRF, optionally rerank by relevance, then format
         fused = self._rrf_fuse(vec_hits, bm25_hits, rrf_k=settings.hybrid_rrf_k)
+        if rerank:
+            fused = self._rerank_passages(query, fused)
         vector_context = self._format_hits(fused)
 
         # Graph context (unchanged path)
@@ -114,4 +145,8 @@ class HybridRetriever:
             logger.warning("Graph retrieval unavailable: %s", exc)
             graph_context = "(knowledge graph unavailable)"
 
-        return {"vector_context": vector_context, "graph_context": graph_context}
+        return {
+            "vector_context": vector_context,
+            "graph_context": graph_context,
+            "_hits": fused,  # raw VectorHit list used by grounding gate / citation registry
+        }

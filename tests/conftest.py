@@ -21,7 +21,7 @@ def settings():
 @pytest.fixture
 def tmp_chroma_dir(monkeypatch):
     """Force ChromaStore to use a throwaway directory for the duration of a test."""
-    with tempfile.TemporaryDirectory() as tmp:
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         monkeypatch.setenv("CHROMA_PERSIST_DIR", tmp)
         from graph_rag.config import Settings
 
@@ -43,12 +43,9 @@ def neo4j_available() -> bool:
 
 @pytest.fixture(scope="session")
 def nomic_available() -> bool:
+    # Provider-agnostic: just try to embed. Works for Ollama/bge-large or Tabby.
     try:
-        from graph_rag.config import settings as s
-
-        if not s.nomic_api_token:
-            return False
-        from graph_rag.embeddings.nomic_embedder import get_embedder
+        from graph_rag.embeddings import get_embedder
 
         get_embedder.cache_clear()
         get_embedder().embed_query("ping")
@@ -65,5 +62,6 @@ def skip_if_no_neo4j(neo4j_available: bool):
 def skip_if_no_nomic(nomic_available: bool):
     if not nomic_available:
         pytest.skip(
-            "Tabby ML is not reachable or NOMIC_API_TOKEN / TABBY_API_TOKEN is not set."
+            "Embedder not reachable — ensure Ollama is running with bge-large loaded "
+            "(OLLAMA_BASE_URL=http://localhost:11434, OLLAMA_EMBEDDING_MODEL=bge-large)."
         )

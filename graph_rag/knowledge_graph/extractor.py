@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from functools import lru_cache
 from typing import Iterable
 
+from graph_rag.knowledge_graph.ontology import canonical_relation, normalize_node_type
+
 logger = logging.getLogger(__name__)
 
 ENTITY_LABELS = {"PERSON", "ORG", "GPE", "LOC", "PRODUCT", "EVENT", "NORP", "WORK_OF_ART", "FAC"}
@@ -88,7 +90,11 @@ class EntityRelationExtractor:
         if not text or self._nlp is None:
             return []
         doc = self._nlp(text)
-        return [(ent.text.strip(), ent.label_) for ent in doc.ents if ent.label_ in ENTITY_LABELS]
+        return [
+            (ent.text.strip(), normalize_node_type(ent.label_))
+            for ent in doc.ents
+            if ent.label_ in ENTITY_LABELS
+        ]
 
     def _spacy_triples(
         self,
@@ -113,7 +119,9 @@ class EntityRelationExtractor:
             if not (subjects and objects and verb):
                 continue
 
-            relation = _sanitize_relation(verb.lemma_)
+            relation = canonical_relation(verb.lemma_)
+            if relation is None:
+                continue  # trivial verb (is/has/…) — skip low-information edge
             for s in subjects:
                 s_span = self._noun_span(s)
                 s_type = self._entity_type(s_span, doc)
@@ -144,8 +152,8 @@ class EntityRelationExtractor:
         s = span.lower()
         for ent in doc.ents:
             if ent.text.lower() == s:
-                return ent.label_
-        return "CONCEPT"
+                return normalize_node_type(ent.label_)
+        return "Concept"
 
     @staticmethod
     def _fallback(text: str, source_chunk_id: str, source_path: str) -> list[Triple]:
@@ -156,13 +164,16 @@ class EntityRelationExtractor:
         )
         for m in pattern.finditer(text):
             subj, verb, obj = m.group(1), m.group(2), m.group(3)
+            relation = canonical_relation(verb)
+            if relation is None:
+                continue  # drop trivial verbs (is/are/has/…)
             triples.append(
                 Triple(
                     subject=subj.strip(),
-                    subject_type="CONCEPT",
-                    relation=_sanitize_relation(verb),
+                    subject_type="Concept",
+                    relation=relation,
                     object_=obj.strip(),
-                    object_type="CONCEPT",
+                    object_type="Concept",
                     source_chunk_id=source_chunk_id,
                     source_path=source_path,
                     confidence=0.4,

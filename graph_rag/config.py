@@ -25,13 +25,41 @@ class Settings(BaseSettings):
     chroma_persist_dir: str = "./chroma_db"
     chroma_collection: str = "graph_rag"
 
-    # OCR — Tesseract + Poppler paths (Windows; empty = rely on PATH)
+    # OCR — Tesseract + Poppler (fallback for image-only PDFs). Leave empty to
+    # rely on PATH, which is the correct setting on Linux/macOS:
+    #   Linux:  apt-get install tesseract-ocr poppler-utils  (already in Dockerfile.api)
+    #   macOS:  brew install tesseract poppler
+    #   Windows: install binaries and set these vars, e.g.:
+    #     TESSERACT_CMD=C:/Program Files/Tesseract-OCR/tesseract.exe
+    #     POPPLER_PATH=C:/path/to/poppler/bin
     tesseract_cmd: str = ""
     poppler_path: str = ""
+
+    # ── Docling (primary PDF parser) ────────────────────────────────────────
+    # Toggle Docling on/off without code changes. When False the loader uses
+    # the legacy pypdf→PyMuPDF→OCR cascade only.
+    use_docling: bool = True
+    # OCR every page of these image-heavy PDFs (labels burned into raster).
+    # Match on path substring; defaults to the atlases folder.
+    docling_force_full_page_ocr_dirs: str = "atlases_pdfs"
+    # Tesseract language(s) for Docling OCR — must match installed tessdata.
+    docling_ocr_lang: str = "eng"
+    # Extract formulas as LaTeX ($$...$$). Uses the CPU CodeFormula model.
+    docling_do_formula_enrichment: bool = True
+    # Parse tables into structured Markdown tables (TableFormer).
+    docling_do_table_structure: bool = True
+    # Skip Docling for files larger than this (MB) — guards against OOM on huge atlases.
+    docling_max_file_mb: int = 250
+    # Cap pages parsed per document (0 = no cap). Bounds worst-case memory/time.
+    docling_max_pages: int = 0
 
     # Data source folders (HTML + PDF ingestion)
     downloads_dir: str = "./downloads"
     atlases_dir: str = "./atlases_pdfs"
+
+    # Incremental ingestion: content-hash manifest of already-ingested files.
+    # Files whose SHA-256 hash is recorded here are skipped on subsequent runs.
+    ingest_manifest_path: str = "./ingest_manifest.json"
 
     # Chunking
     chunk_size: int = 800
@@ -44,27 +72,90 @@ class Settings(BaseSettings):
     top_k_bm25: int = 5
     hybrid_rrf_k: int = 60
 
+    # ── History-aware retrieval & answer quality ────────────────────────────
+    # Query contextualization: rewrite a follow-up ("what's its resolution?")
+    # into a standalone search query using recent turns BEFORE retrieval, so the
+    # embedding/keyword search targets the right entity. Gated — the LLM rewrite
+    # fires only on detected follow-ups, so most turns pay nothing.
+    enable_query_contextualization: bool = True
+    contextualizer_max_history_chars: int = 1500
+    # Embedding rerank of the fused vector+BM25 passages against the query
+    # (cheap/local, same mechanism as graph_rerank). Pulls a wider candidate
+    # pool, reranks, then keeps the most relevant few — less noise, more grounded.
+    enable_passage_rerank: bool = True
+    rerank_candidate_pool: int = 20
+    top_k_passages: int = 6
+    # Rolling conversation summary: when history exceeds the recent window,
+    # fold the evicted turns into a running summary so older context is not lost.
+    # Opt-in — adds an LLM call on overflow only.
+    enable_conversation_summary: bool = False
+    summary_keep_recent_turns: int = 6
+
     # LLM — Tabby ML (OpenAI-compatible — active backend for both LLM and embeddings)
     # Credentials must come from .env. Never hardcode the token here.
     tabby_base_url: str = "http://localhost:8080/v1"
     tabby_api_token: str = ""
     tabby_model: str = "Qwen2-1.5B-Instruct"
 
-    # Embeddings — Nomic Embed Text served by Tabby ML
-    # NOMIC_BASE_URL and NOMIC_API_TOKEN fall back to the shared TABBY_* values
-    # so a single Tabby ML instance serving both LLM and embeddings needs only
-    # one set of credentials in .env. Override with NOMIC_* to point at a
-    # separate embeddings server.
-    nomic_model_name: str = "nomic-embed-text"
-    nomic_base_url: str = Field(
-        default="http://localhost:8080/v1",
-        validation_alias=AliasChoices("nomic_base_url", "tabby_base_url"),
-    )
-    # Credential — never hardcoded. Resolved from NOMIC_API_TOKEN or TABBY_API_TOKEN.
-    nomic_api_token: str = Field(
+    # ── Knowledge-graph extraction LLM ──────────────────────────────────────
+    # extraction_backend selects HOW triples are mined from each chunk:
+    #   "llm"   — schema-guided LLM extraction (richest graph)
+    #   "spacy" — spaCy SVO dependency parse (offline, no LLM needed)
+    #   "auto"  — use the LLM when the endpoint is reachable, else fall back to spaCy
+    extraction_backend: str = "auto"
+    # SWITCH THE EXTRACTION MODEL FROM .env WITHOUT TOUCHING CODE.
+    # Set TABBY_EXTRACTION_MODEL to any model Tabby ML is serving (e.g. a larger,
+    # more accurate model than the chat model). Empty → reuse TABBY_MODEL.
+    tabby_extraction_model: str = Field(
         default="",
-        validation_alias=AliasChoices("nomic_api_token", "tabby_api_token"),
+        validation_alias=AliasChoices("tabby_extraction_model", "extraction_model"),
     )
+    # Endpoint/credentials for the extraction LLM. Default to the shared TABBY_*
+    # values so a single Tabby ML instance needs no extra configuration. Override
+    # with EXTRACTION_LLM_* only to point extraction at a separate server.
+    extraction_llm_base_url: str = Field(
+        default="http://localhost:8080/v1",
+        validation_alias=AliasChoices("extraction_llm_base_url", "tabby_base_url"),
+    )
+    extraction_llm_api_token: str = Field(
+        default="",
+        validation_alias=AliasChoices("extraction_llm_api_token", "tabby_api_token"),
+    )
+    extraction_temperature: float = 0.0
+    extraction_max_tokens: int = 2048
+    # Skip chunks longer than this many characters in a single LLM call (they are
+    # already bounded by CHUNK_SIZE, but this guards against pathological inputs).
+    extraction_max_chars: int = 6000
+
+    # ── Reasoning-aware retrieval & iterative answering ─────────────────────
+    # Query decomposition: split a complex question into sub-questions before
+    # retrieval (Phase 6). Extra LLM call — off by default to keep latency low.
+    enable_query_decomposition: bool = False
+    max_subquestions: int = 4
+    # Embedding rerank of graph paths against the question (Phase 6). Cheap/local.
+    graph_rerank: bool = True
+    top_k_paths: int = 8
+    # Iterative retrieve→reason→re-retrieve answer loop with a faithfulness
+    # self-check (Phase 7). Off by default — multiple LLM calls per question.
+    enable_iterative_reasoning: bool = False
+    max_reasoning_iterations: int = 3
+    enable_faithfulness_check: bool = True
+    # Community summaries (Phase 6 GraphRAG global view). Build offline with
+    # `python main.py build-communities`; used at query time when present.
+    enable_community_summaries: bool = False
+    community_collection: str = "graph_communities"
+    max_communities: int = 50
+    community_min_degree: int = 3
+
+    def extraction_model_name(self) -> str:
+        """Model used for KG extraction — TABBY_EXTRACTION_MODEL or fallback to TABBY_MODEL."""
+        return self.tabby_extraction_model or self.tabby_model
+
+    # ── Embeddings — bge-large via Ollama ──────────────────────────────────
+    # Endpoint (host:port only) and model come from .env; never hardcoded.
+    # The /api/embeddings path is appended automatically by OllamaEmbedder.
+    ollama_base_url: str = "http://localhost:11434"
+    ollama_embedding_model: str = "bge-large"
 
     # System prompt file path (change this to reconfigure LLM behaviour)
     system_prompt_path: str = "./prompts/system_prompt.txt"

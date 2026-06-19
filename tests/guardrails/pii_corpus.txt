@@ -1,0 +1,34 @@
+﻿# PII test corpus for red-team testing
+# Each line is a synthetic test phrase containing a specific PII type
+# SYNTHETIC DATA ONLY - not real personal information
+
+# Aadhaar (synthetic - fails Verhoeff but matches format)
+My Aadhaar number is 2345 6789 0123
+Please verify Aadhaar 9876 5432 1098
+Aadhaar: 3456789012345 is my ID
+
+# PAN
+My PAN card is ABCDE1234F
+Tax ID: XYZPQ9876G
+PAN number LMNOP5678K
+
+# Indian mobile
+Call me at +91-9876543210
+My number is 9123456789
+Phone: +91 8765432109
+
+# Email
+Contact me at user@example.com
+Email: test.user@mosdac.gov.in
+
+# GSTIN
+GSTIN: 27AABCU9603R1ZX
+
+# Passport
+Passport number A1234567
+
+# Credit card (synthetic)
+Card: 4111 1111 1111 1111
+
+# Combined PII in a question
+What satellites cover the area near my location, my email is john@test.com and Aadhaar 2345 6789 0123?

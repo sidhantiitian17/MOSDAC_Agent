@@ -1,0 +1,172 @@
+# MOSDAC GraphRAG evaluation set (Phase 0)
+# Types: single (one fact), multihop (link 2+ facts), comparison (compare/compute).
+# expected_entities/keywords are SOFT retrieval targets used for hit-rate scoring;
+# reference is a short gold answer used by the optional LLM judge. Adjust to the
+# actual corpus you ingest — these are domain-typical MOSDAC questions.
+
+# ── single-fact technical ──────────────────────────────────────────────────
+- id: s1
+  type: single
+  question: "What spatial resolution does the OCM sensor provide?"
+  expected_entities: ["OCM"]
+  expected_keywords: ["resolution", "m"]
+  reference: "Ocean Colour Monitor (OCM) provides a spatial resolution of around 360 m."
+
+- id: s2
+  type: single
+  question: "Which satellite carries the Scatterometer (OSCAT)?"
+  expected_entities: ["Oceansat-2", "Scatterometer"]
+  expected_keywords: ["carries"]
+  reference: "Oceansat-2 carries the Ku-band Scatterometer (OSCAT)."
+
+- id: s3
+  type: single
+  question: "What parameter does the SARAL/AltiKa altimeter measure?"
+  expected_entities: ["SARAL", "AltiKa"]
+  expected_keywords: ["sea surface height", "altimeter"]
+  reference: "SARAL/AltiKa measures sea surface height / ocean topography."
+
+- id: s4
+  type: single
+  question: "Which agency operates the INSAT-3D satellite?"
+  expected_entities: ["INSAT-3D", "ISRO"]
+  expected_keywords: ["operated", "ISRO"]
+  reference: "INSAT-3D is operated by ISRO."
+
+- id: s5
+  type: single
+  question: "What is the swath width of the Scatterometer on Oceansat-2?"
+  expected_entities: ["Scatterometer", "Oceansat-2"]
+  expected_keywords: ["swath", "km"]
+  reference: "The OSCAT scatterometer has a swath of roughly 1400 km."
+
+- id: s6
+  type: single
+  question: "What does the Ocean Colour Monitor measure?"
+  expected_entities: ["OCM"]
+  expected_keywords: ["chlorophyll", "ocean colour"]
+  reference: "OCM measures ocean colour / chlorophyll concentration."
+
+- id: s7
+  type: single
+  question: "What is the temporal resolution (revisit) of Oceansat-2?"
+  expected_entities: ["Oceansat-2"]
+  expected_keywords: ["revisit", "days"]
+  reference: "Oceansat-2 has a revisit period of about 2 days."
+
+- id: s8
+  type: single
+  question: "What products are derived from INSAT-3D imager data?"
+  expected_entities: ["INSAT-3D"]
+  expected_keywords: ["sea surface temperature", "product"]
+  reference: "INSAT-3D imager data yields products such as SST, outgoing longwave radiation, and cloud products."
+
+# ── multi-hop (link 2+ facts/entities) ─────────────────────────────────────
+- id: m1
+  type: multihop
+  question: "Which sensors on Oceansat-2 measure sea-surface parameters, and what do they measure?"
+  expected_entities: ["Oceansat-2", "OCM", "Scatterometer"]
+  expected_keywords: ["measures", "wind", "chlorophyll"]
+  reference: "Oceansat-2 carries OCM (ocean colour/chlorophyll) and OSCAT scatterometer (ocean surface wind vectors)."
+
+- id: m2
+  type: multihop
+  question: "What parameters can be studied using sensors carried by INSAT-3D?"
+  expected_entities: ["INSAT-3D"]
+  expected_keywords: ["imager", "sounder", "temperature"]
+  reference: "INSAT-3D carries an Imager and a Sounder that provide temperature, humidity and cloud parameters."
+
+- id: m3
+  type: multihop
+  question: "Which ISRO satellites carry ocean colour sensors and what resolution do they provide?"
+  expected_entities: ["Oceansat-2", "OCM"]
+  expected_keywords: ["ocean colour", "resolution"]
+  reference: "Oceansat-2 (and Oceansat-3) carry the Ocean Colour Monitor providing ~360 m resolution."
+
+- id: m4
+  type: multihop
+  question: "From which satellite and sensor is chlorophyll concentration derived?"
+  expected_entities: ["Oceansat-2", "OCM"]
+  expected_keywords: ["chlorophyll", "OCM"]
+  reference: "Chlorophyll concentration is derived from the OCM sensor on Oceansat-2."
+
+- id: m5
+  type: multihop
+  question: "Which sensor measures ocean surface winds and on which satellite is it carried?"
+  expected_entities: ["Scatterometer", "Oceansat-2"]
+  expected_keywords: ["wind", "scatterometer"]
+  reference: "The OSCAT scatterometer measures ocean surface wind vectors and is carried on Oceansat-2/SCATSAT-1."
+
+- id: m6
+  type: multihop
+  question: "What sensors does SCATSAT-1 carry and what application do their products serve?"
+  expected_entities: ["SCATSAT-1", "Scatterometer"]
+  expected_keywords: ["wind", "cyclone"]
+  reference: "SCATSAT-1 carries a Ku-band scatterometer whose wind products support cyclone monitoring and weather forecasting."
+
+# ── comparison / quantitative ──────────────────────────────────────────────
+- id: c1
+  type: comparison
+  question: "Which has finer spatial resolution: OCM or the INSAT-3D imager?"
+  expected_entities: ["OCM", "INSAT-3D"]
+  expected_keywords: ["resolution", "m", "km"]
+  reference: "OCM (~360 m) has finer spatial resolution than the INSAT-3D imager (1-4 km)."
+
+- id: c2
+  type: comparison
+  question: "Compare the scatterometer swath width between Oceansat-2 and SCATSAT-1."
+  expected_entities: ["Oceansat-2", "SCATSAT-1"]
+  expected_keywords: ["swath", "km"]
+  reference: "Both carry Ku-band scatterometers with swaths of around 1400 km; SCATSAT-1's is comparable to Oceansat-2's OSCAT."
+
+- id: c3
+  type: comparison
+  question: "Which satellite has a shorter revisit time, Oceansat-2 or INSAT-3D?"
+  expected_entities: ["Oceansat-2", "INSAT-3D"]
+  expected_keywords: ["revisit", "geostationary"]
+  reference: "INSAT-3D is geostationary (near-continuous over the same region) whereas Oceansat-2 revisits about every 2 days."
+
+- id: c4
+  type: comparison
+  question: "Between OCM and Scatterometer, which provides higher spatial resolution and by how much?"
+  expected_entities: ["OCM", "Scatterometer"]
+  expected_keywords: ["resolution", "km", "m"]
+  reference: "OCM (~360 m) has much higher spatial resolution than the scatterometer (~25-50 km)."
+
+- id: c5
+  type: comparison
+  question: "Express the OCM spatial resolution in metres and compare it to a 1 km imager pixel."
+  expected_entities: ["OCM"]
+  expected_keywords: ["360", "m", "1 km"]
+  reference: "OCM is about 360 m, roughly one third of a 1 km (1000 m) imager pixel."
+
+# ── follow-up / conversational ─────────────────────────────────────────────
+# `setup` turns establish an entity; `question` refers back to it with a pronoun
+# or ellipsis. These measure history-aware retrieval: with contextualization the
+# follow-up should resolve to the right entity, lifting retrieval hit-rate.
+- id: f1
+  type: followup
+  setup:
+    - "What sensors does Oceansat-2 carry?"
+  question: "What spatial resolution does it provide?"
+  expected_entities: ["Oceansat-2", "OCM"]
+  expected_keywords: ["resolution", "m"]
+  reference: "Its Ocean Colour Monitor (OCM) provides about 360 m spatial resolution."
+
+- id: f2
+  type: followup
+  setup:
+    - "Tell me about the Scatterometer on Oceansat-2."
+  question: "And what is its swath width?"
+  expected_entities: ["Scatterometer", "Oceansat-2"]
+  expected_keywords: ["swath", "km"]
+  reference: "The OSCAT scatterometer has a swath of roughly 1400 km."
+
+- id: f3
+  type: followup
+  setup:
+    - "Which agency operates INSAT-3D?"
+  question: "What products does it provide?"
+  expected_entities: ["INSAT-3D"]
+  expected_keywords: ["product", "temperature"]
+  reference: "INSAT-3D provides products such as sea surface temperature, OLR and cloud products."

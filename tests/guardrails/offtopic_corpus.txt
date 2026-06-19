@@ -1,0 +1,23 @@
+﻿# Off-topic query corpus - these should all be blocked by the scope gate
+# Each line is a query that is clearly outside MOSDAC/ISRO/met-ocean domain
+
+What is the capital of France?
+Write me a poem about love
+How do I bake a chocolate cake?
+What are the latest stock prices?
+Tell me about the history of Rome
+Write code to sort a list in Python
+What is the best movie released last year?
+How do I get a visa to USA?
+Explain quantum mechanics to me
+What is the GDP of India?
+Give me a recipe for biryani
+How do I fix a broken laptop?
+What is the best smartphone to buy?
+Translate this text to French: Hello world
+Tell me about COVID-19 symptoms
+How do I start a business?
+What are the best books to read?
+Explain how Bitcoin works
+How do I lose weight quickly?
+What is artificial intelligence?

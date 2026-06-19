@@ -18,16 +18,15 @@
 8. [File-by-File: service.py](#8-file-by-file-servicepy)
 9. [File-by-File: routes.py](#9-file-by-file-routespy)
 10. [File-by-File: main.py](#10-file-by-file-mainpy)
-11. [The MOSDAC Router (mosdac_agent/routes.py)](#11-the-mosdac-router-mosdac_agentroutespy)
-12. [Running the API Locally](#12-running-the-api-locally)
-13. [Running the API in Docker](#13-running-the-api-in-docker)
-14. [The Auto-Generated Docs (/docs)](#14-the-auto-generated-docs-docs)
-15. [Testing FastAPI Endpoints](#15-testing-fastapi-endpoints)
-16. [Build Your Own API — Templates and Recipes](#16-build-your-own-api--templates-and-recipes)
-17. [Environment Variables and .env Files](#17-environment-variables-and-env-files)
-18. [CORS — Letting Browsers Talk to Your API](#18-cors--letting-browsers-talk-to-your-api)
-19. [Common Errors and How to Fix Them](#19-common-errors-and-how-to-fix-them)
-20. [Quick Reference Cheat Sheet](#20-quick-reference-cheat-sheet)
+11. [Running the API Locally](#11-running-the-api-locally)
+12. [Running the API in Docker](#12-running-the-api-in-docker)
+13. [The Auto-Generated Docs (/docs)](#13-the-auto-generated-docs-docs)
+14. [Testing FastAPI Endpoints](#14-testing-fastapi-endpoints)
+15. [Build Your Own API — Templates and Recipes](#15-build-your-own-api--templates-and-recipes)
+16. [Environment Variables and .env Files](#16-environment-variables-and-env-files)
+17. [CORS — Letting Browsers Talk to Your API](#17-cors--letting-browsers-talk-to-your-api)
+18. [Common Errors and How to Fix Them](#18-common-errors-and-how-to-fix-them)
+19. [Quick Reference Cheat Sheet](#19-quick-reference-cheat-sheet)
 
 ---
 
@@ -349,32 +348,31 @@ HTTP Request from browser / JS widget
 |  create_app() assembles everything into one FastAPI app  |
 |  app = FastAPI(title=...) + CORS middleware              |
 |  app.include_router(build_router(service))               |
-|  app.include_router(build_mosdac_router(service))  <--+  |
-+----------------------------------------------------+--+--+
++----------------------------------------------------+-----+
                                                      |
-       +-----------------------+        +------------+----------+
-       |   chat_api/           |        |  mosdac_agent/        |
-       |   routes.py           |        |  routes.py            |
-       |                       |        |                       |
-       |  GET  /health         |        |  GET  /mosdac/health  |
-       |  GET  /config         |        |  GET  /mosdac/config  |
-       |  POST /chat           |        |  POST /mosdac/chat    |
-       |  DELETE /chat/{id}    |        |  DELETE /mosdac/...   |
-       +----------+------------+        +----------+------------+
-                  | calls                          | calls
-       +----------v------------+        +----------v------------+
-       |  chat_api/            |        |  mosdac_agent/        |
-       |  service.py           |        |  agent.py             |
-       |  ChatService          |        |  MosdacAgentService   |
-       +----------+------------+        +-----------------------+
-                  | uses
-    +-------------+------------------+
-    |             |                  |
-    v             v                  v
-HybridRetriever  LangChain Chain   SessionStore
-(Neo4j+ChromaDB) (RAG + LLM)      (memory/redis)
-                                       ^
-                             chat_api/session.py
+                                          +------------+----------+
+                                          |   chat_api/           |
+                                          |   routes.py           |
+                                          |                       |
+                                          |  GET  /health         |
+                                          |  GET  /config         |
+                                          |  POST /chat           |
+                                          |  DELETE /chat/{id}    |
+                                          +----------+------------+
+                                                     | calls
+                                          +----------v------------+
+                                          |  chat_api/            |
+                                          |  service.py           |
+                                          |  ChatService          |
+                                          +----------+------------+
+                                                     | uses
+                            +-------------+------------------+
+                            |             |                  |
+                            v             v                  v
+                     HybridRetriever  LangChain Chain   SessionStore
+                     (Neo4j+ChromaDB) (RAG + LLM)      (memory/redis)
+                                                            ^
+                                                  chat_api/session.py
 
 Supporting files:
   chat_api/models.py  -- Pydantic request/response shapes
@@ -448,8 +446,6 @@ class ChatRequest(BaseModel):
     # "..." means required
     # min_length/max_length are validated automatically
 ```
-
-This is exactly what `mosdac_agent/routes.py` does for its own request model.
 
 ### How to add a new field
 
@@ -988,27 +984,7 @@ def create_app(
     # 4. Register routes
     app.include_router(build_router(service))
 
-    # 5. Conditionally mount the MOSDAC agent (only if enabled in env)
-    _maybe_mount_mosdac(app, sessions)
-
     return app
-
-
-def _maybe_mount_mosdac(app: FastAPI, sessions) -> None:
-    """Mount /mosdac/* routes only if MOSDAC_ENABLE_MOSDAC_ENDPOINT=true."""
-    try:
-        from mosdac_agent.config import mosdac_settings
-        if not mosdac_settings.enable_mosdac_endpoint:
-            return   # skip — not enabled
-        from mosdac_agent.agent import AgentRunner, MosdacAgentService, build_agent
-        from mosdac_agent.routes import build_mosdac_router
-
-        agent = build_agent()
-        runner = AgentRunner(agent=agent)
-        service = MosdacAgentService(runner=runner, sessions=sessions)
-        app.include_router(build_mosdac_router(service))
-    except Exception as exc:
-        logger.warning("MOSDAC endpoint not mounted: %s", exc)
 
 
 # Module-level singleton -- uvicorn uses this
@@ -1058,70 +1034,7 @@ connects to all backends, and the resulting `app` handles all requests.
 
 ---
 
-## 11. The MOSDAC Router (mosdac_agent/routes.py)
-
-**File:** `mosdac_agent/routes.py`
-**Purpose:** A second router mounted on the same app, adding MOSDAC-specific endpoints at `/mosdac/*`.
-
-### The custom header
-
-```python
-from fastapi import Header
-from typing import Optional
-
-@router.post("/chat", response_model=MosdacChatResponse)
-def chat(
-    req: MosdacChatRequest,
-    x_mosdac_user: Optional[str] = Header(default=None, alias="X-MOSDAC-User"),
-    # alias maps the HTTP header "X-MOSDAC-User" to the Python variable
-):
-    user = _resolve_user(x_mosdac_user)
-    ...
-```
-
-The client sends:
-```
-POST /mosdac/chat
-X-MOSDAC-User: john.doe@example.com
-Content-Type: application/json
-
-{"session_id": "abc", "message": "search for INSAT-3D data"}
-```
-
-### User resolution
-
-```python
-def _resolve_user(sso_header: Optional[str]) -> str:
-    s = mosdac_settings
-    if s.require_sso_header:
-        if not sso_header:
-            raise HTTPException(status_code=401, detail="SSO required")
-        return sso_header
-    return sso_header or s.sso_dev_user  # fallback for development
-```
-
-In production: `require_sso_header=True` → every request must include `X-MOSDAC-User`
-In development: `require_sso_header=False` → uses `sso_dev_user` from config
-
-### How routes are mounted on the main app
-
-In `chat_api/main.py`:
-```python
-app.include_router(build_mosdac_router(service))
-# prefix="/mosdac" is defined inside build_mosdac_router()
-```
-
-This adds to the main app:
-- `GET /mosdac/health`
-- `GET /mosdac/config`
-- `POST /mosdac/chat`
-- `DELETE /mosdac/chat/{session_id}`
-
-The main app's own routes stay at `/health`, `/chat`, etc. — zero conflict.
-
----
-
-## 12. Running the API Locally
+## 11. Running the API Locally
 
 ### Prerequisites
 
@@ -1147,20 +1060,7 @@ uvicorn chat_api.main:app --host 0.0.0.0 --port 8000 --reload
 curl http://localhost:8000/health
 ```
 
-### Option B — Run without Neo4j / LLM (mock mode)
-
-```bash
-# On Windows PowerShell:
-$env:MOSDAC_MOSDAC_USE_MOCK="true"
-$env:MOSDAC_ENABLE_MOSDAC_ENDPOINT="true"
-uvicorn chat_api.main:app --port 8000 --reload
-
-# On Linux/macOS:
-MOSDAC_MOSDAC_USE_MOCK=true MOSDAC_ENABLE_MOSDAC_ENDPOINT=true \
-    uvicorn chat_api.main:app --port 8000 --reload
-```
-
-### Option C — Development with verbose logs
+### Option B — Development with verbose logs
 
 ```bash
 uvicorn chat_api.main:app --host 0.0.0.0 --port 8000 --reload --log-level debug
@@ -1183,7 +1083,7 @@ curl -X DELETE http://localhost:8000/chat/test123
 
 ---
 
-## 13. Running the API in Docker
+## 12. Running the API in Docker
 
 ### The Dockerfile.api explained line by line
 
@@ -1245,7 +1145,7 @@ docker compose build chat_api && docker compose --profile ollama up chat_api
 
 ---
 
-## 14. The Auto-Generated Docs (/docs)
+## 13. The Auto-Generated Docs (/docs)
 
 FastAPI generates interactive documentation automatically from your code.
 
@@ -1300,7 +1200,7 @@ def chat(req: ChatRequest):
 
 ---
 
-## 15. Testing FastAPI Endpoints
+## 14. Testing FastAPI Endpoints
 
 ### Using httpx TestClient
 
@@ -1357,33 +1257,15 @@ def test_chat_returns_400_for_bad_input():
 pytest tests/
 
 # Run a specific file
-pytest tests/test_mosdac_tools.py
+pytest tests/test_chat_api.py
 
 # Run with verbose output
 pytest tests/ -v
 ```
 
-### Testing routes with custom headers
-
-```python
-def test_mosdac_chat_with_sso_header():
-    fake_service = MagicMock()
-    fake_service.chat.return_value = "Order placed."
-    app = create_app(service=fake_service)
-    client = TestClient(app)
-
-    response = client.post(
-        "/mosdac/chat",
-        headers={"X-MOSDAC-User": "alice@example.com"},
-        json={"session_id": "s1", "message": "search for data"}
-    )
-    assert response.status_code == 200
-    assert response.json()["user"] == "alice@example.com"
-```
-
 ---
 
-## 16. Build Your Own API — Templates and Recipes
+## 15. Build Your Own API — Templates and Recipes
 
 ### Recipe 1: Minimal Working API (3 files)
 
@@ -1614,7 +1496,7 @@ That's it — the new endpoint appears in `/docs` automatically.
 
 ---
 
-## 17. Environment Variables and .env Files
+## 16. Environment Variables and .env Files
 
 ### Why environment variables?
 
@@ -1665,7 +1547,7 @@ __pycache__/
 
 ---
 
-## 18. CORS — Letting Browsers Talk to Your API
+## 17. CORS — Letting Browsers Talk to Your API
 
 ### What is CORS?
 
@@ -1712,7 +1594,7 @@ CHAT_API_ALLOWED_ORIGINS=http://localhost,http://mosdac.gov.in,https://app.examp
 
 ---
 
-## 19. Common Errors and How to Fix Them
+## 18. Common Errors and How to Fix Them
 
 ### Error: `422 Unprocessable Entity`
 **Cause:** Client sent data that doesn't match your Pydantic model.
@@ -1781,7 +1663,7 @@ docker compose logs chat_api --follow
 
 ---
 
-## 20. Quick Reference Cheat Sheet
+## 19. Quick Reference Cheat Sheet
 
 ### Project Endpoints
 
@@ -1791,10 +1673,6 @@ docker compose logs chat_api --follow
 | GET | `/config` | Branding config for JS widget |
 | POST | `/chat` | Send a message to the chatbot |
 | DELETE | `/chat/{session_id}` | Clear a conversation |
-| GET | `/mosdac/health` | MOSDAC agent liveness |
-| GET | `/mosdac/config` | MOSDAC branding |
-| POST | `/mosdac/chat` | Chat with the MOSDAC order agent |
-| DELETE | `/mosdac/chat/{session_id}` | Clear MOSDAC conversation |
 | GET | `/docs` | Swagger UI (auto-generated) |
 | GET | `/redoc` | ReDoc (auto-generated) |
 
@@ -1817,17 +1695,6 @@ curl -X POST http://localhost:8000/chat \
 
 # Clear a session
 curl -X DELETE http://localhost:8000/chat/s1
-
-# MOSDAC chat (dev mode)
-curl -X POST http://localhost:8000/mosdac/chat \
-  -H "Content-Type: application/json" \
-  -d '{"session_id":"m1","message":"search for INSAT-3D data in Tamil Nadu"}'
-
-# MOSDAC chat (with SSO header)
-curl -X POST http://localhost:8000/mosdac/chat \
-  -H "Content-Type: application/json" \
-  -H "X-MOSDAC-User: alice@example.com" \
-  -d '{"session_id":"m1","message":"order INSAT-3D data"}'
 ```
 
 ### Key Environment Variables
@@ -1841,7 +1708,6 @@ curl -X POST http://localhost:8000/mosdac/chat \
 | `CHAT_API_REDIS_URL` | Redis connection string | `""` |
 | `CHAT_API_ENABLE_SCREENSHOT` | Allow image uploads | `true` |
 | `CHAT_API_MAX_HISTORY_TURNS` | History depth | `10` |
-| `MOSDAC_ENABLE_MOSDAC_ENDPOINT` | Mount `/mosdac/*` routes | `false` |
 | `LLM_API_BASE` | LLM endpoint URL | `http://ollama:11434/v1` |
 | `NEO4J_URI` | Neo4j bolt URL | `bolt://localhost:7687` |
 
@@ -1855,7 +1721,6 @@ curl -X POST http://localhost:8000/mosdac/chat \
 | `chat_api/service.py` | Business logic | Retriever, chain, LLM, sessions |
 | `chat_api/routes.py` | HTTP endpoints | Models, service, config |
 | `chat_api/main.py` | App assembly | All of the above |
-| `mosdac_agent/routes.py` | MOSDAC HTTP endpoints | MOSDAC service, config |
 | `Dockerfile.api` | Container build | System deps, Python deps |
 
 ### FastAPI Decorators Summary

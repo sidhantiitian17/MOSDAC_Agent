@@ -63,27 +63,84 @@ def test_graph_retriever_formats_paths():
 
 def test_hybrid_retriever_returns_both_contexts():
     from graph_rag.retrieval.hybrid_retriever import HybridRetriever
+    from graph_rag.retrieval.vector_retriever import VectorHit
 
     h = HybridRetriever()
+    # Vector + BM25 hits are RRF-fused into vector_context; graph is independent.
     h._vector = MagicMock()
-    h._vector.as_context.return_value = "VECTOR_CTX"
+    h._vector.retrieve.return_value = [VectorHit("Apple bought Beats.", "a.pdf", 0.1, "c1")]
+    h._bm25 = MagicMock()
+    h._bm25.retrieve.return_value = []
     h._graph = MagicMock()
     h._graph.as_context.return_value = "GRAPH_CTX"
 
     out = h.retrieve("query")
-    assert out["vector_context"] == "VECTOR_CTX"
+    assert "Apple bought Beats." in out["vector_context"]
     assert out["graph_context"] == "GRAPH_CTX"
 
 
 def test_hybrid_retriever_degrades_when_one_side_fails():
     from graph_rag.retrieval.hybrid_retriever import HybridRetriever
+    from graph_rag.retrieval.vector_retriever import VectorHit
 
     h = HybridRetriever()
     h._vector = MagicMock()
-    h._vector.as_context.return_value = "VECTOR_OK"
+    h._vector.retrieve.return_value = [VectorHit("VEC OK", "v.pdf", 0.1, "c1")]
+    h._bm25 = MagicMock()
+    h._bm25.retrieve.return_value = []
     h._graph = MagicMock()
     h._graph.as_context.side_effect = RuntimeError("neo4j down")
 
     out = h.retrieve("query")
-    assert out["vector_context"] == "VECTOR_OK"
+    assert "VEC OK" in out["vector_context"]
     assert "unavailable" in out["graph_context"].lower()
+
+
+def test_hybrid_retriever_reranks_fused_passages():
+    from graph_rag.retrieval.hybrid_retriever import HybridRetriever
+    from graph_rag.retrieval.vector_retriever import VectorHit
+
+    h = HybridRetriever()
+    h._vector = MagicMock()
+    h._vector.retrieve.return_value = [
+        VectorHit("ALPHA", "a.pdf", 0.3, "c1"),
+        VectorHit("BRAVO", "b.pdf", 0.2, "c2"),
+        VectorHit("CHARLIE", "c.pdf", 0.1, "c3"),
+    ]
+    h._bm25 = MagicMock()
+    h._bm25.retrieve.return_value = []
+    h._graph = MagicMock()
+    h._graph.as_context.return_value = "GRAPH_CTX"
+
+    # Embedder that makes BRAVO the most similar to the query, reordering it first.
+    embedder = MagicMock()
+    embedder.embed_query.return_value = [1.0, 0.0]
+    embedder.embed_documents.return_value = [[0.0, 1.0], [1.0, 0.0], [0.0, 1.0]]
+    h._embedder = embedder
+
+    ctx = h.retrieve("query")["vector_context"]
+    assert ctx.index("BRAVO") < ctx.index("ALPHA")  # rerank promoted BRAVO
+
+
+def test_hybrid_retriever_rerank_falls_back_when_embedder_unavailable():
+    from graph_rag.retrieval.hybrid_retriever import HybridRetriever
+    from graph_rag.retrieval.vector_retriever import VectorHit
+
+    h = HybridRetriever()
+    h._vector = MagicMock()
+    h._vector.retrieve.return_value = [
+        VectorHit("ALPHA", "a.pdf", 0.3, "c1"),
+        VectorHit("BRAVO", "b.pdf", 0.2, "c2"),
+    ]
+    h._bm25 = MagicMock()
+    h._bm25.retrieve.return_value = []
+    h._graph = MagicMock()
+    h._graph.as_context.return_value = "G"
+
+    embedder = MagicMock()
+    embedder.embed_query.side_effect = RuntimeError("embeddings down")
+    h._embedder = embedder
+
+    # Degrades to RRF order — ALPHA (higher vector rank) stays first.
+    ctx = h.retrieve("query")["vector_context"]
+    assert ctx.index("ALPHA") < ctx.index("BRAVO")

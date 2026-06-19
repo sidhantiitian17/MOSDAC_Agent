@@ -10,7 +10,6 @@
 |---|---|---|
 | LLM (graph_rag chain) | LongCat cloud API | Tabby ML (OpenAI-compatible) |
 | LLM (chat_api) | Qwen via Ollama | Tabby ML (OpenAI-compatible) |
-| LLM (mosdac_agent) | Qwen via Ollama | Tabby ML (OpenAI-compatible) |
 | Embeddings (ingestion) | NVIDIA NIM cloud API | BAAI/bge-small-en-v1.5 (local) |
 | Embeddings (retrieval) | NVIDIA NIM cloud API | BAAI/bge-small-en-v1.5 (local) |
 | Vector Store | ChromaDB (local) | ChromaDB (unchanged, already local) |
@@ -63,8 +62,6 @@ Internet: ZERO — completely air-gapped after cloning repo
 | `graph_rag/vector_store/chroma_store.py` | Remove Gemini-specific retry/rate-limit logic |
 | `graph_rag/knowledge_graph/neo4j_store.py` | Support `NEO4J_AUTH=none` connection |
 | `chat_api/main.py` | Switch Qwen → Tabby |
-| `mosdac_agent/config.py` | Default LLM settings to Tabby |
-| `mosdac_agent/agent.py` | Add `streaming=True` (required by Tabby) |
 | `docker-compose.yml` | Remove Ollama/vLLM; update Neo4j to 5.18.0; point to Tabby |
 | `.env` | Add Tabby + BGE vars; two-environment comment blocks |
 | `requirement.txt` | Remove cloud SDKs; add sentence-transformers + langchain-huggingface |
@@ -227,40 +224,6 @@ from graph_rag.llm.qwen_client import get_llm
 
 # AFTER
 from graph_rag.llm.tabby_client import get_llm
-```
-
-### 2.5 Modify `mosdac_agent/config.py` — update LLM defaults
-
-```python
-# BEFORE
-agent_llm_base_url: str = "http://localhost:11434/v1"  # Ollama OpenAI-compat
-agent_llm_model: str = "qwen2.5:32b"
-agent_llm_api_key: str = "ollama"
-
-# AFTER
-agent_llm_base_url: str = "http://localhost:8080/v1"   # Tabby ML
-agent_llm_model: str = "Qwen2-1.5B-Instruct"
-agent_llm_api_key: str = "your_tabby_token_here"
-```
-
-These remain overridable via `.env` vars `AGENT_LLM_BASE_URL`, `AGENT_LLM_MODEL`,
-`AGENT_LLM_API_KEY` so the ISRO token can be injected without code changes.
-
-### 2.6 Modify `mosdac_agent/agent.py` — add streaming=True
-
-In `_build_default_llm()` (lines 64–71):
-```python
-# BEFORE
-return ChatOpenAI(
-    ...
-    streaming=False,
-)
-
-# AFTER
-return ChatOpenAI(
-    ...
-    streaming=True,  # Tabby ML requires streaming or calls time out
-)
 ```
 
 ---
@@ -509,10 +472,7 @@ pytest>=8.0
 pytest-mock>=3.12
 httpx>=0.27
 
-# MOSDAC agent stack
-langgraph>=0.2
-fastmcp>=2.5
-streamlit>=1.36
+# Utilities
 requests>=2.31
 ```
 
@@ -631,7 +591,7 @@ Execute phases in this sequence to avoid broken intermediate states:
 1. **Phase 6** — Update `requirement.txt`, then `pip install -r requirement.txt`
 2. **Phase 7** — Pre-download BGE model + spaCy model while internet is still available
 3. **Phase 1** — Create `bge_embedder.py` + update `config.py` + `pipeline.py` + `vector_retriever.py` + `chroma_store.py`
-4. **Phase 2** — Create `tabby_client.py` + update `graph_rag_chain.py` + `chat_api/main.py` + `mosdac_agent/config.py` + `mosdac_agent/agent.py`
+4. **Phase 2** — Create `tabby_client.py` + update `graph_rag_chain.py` + `chat_api/main.py`
 5. **Phase 3** — Update `.env` Neo4j block
 6. **Phase 4** — Rewrite `docker-compose.yml`
 7. **Phase 5** — Restructure `.env` with two environment blocks

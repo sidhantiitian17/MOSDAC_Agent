@@ -7,11 +7,9 @@ new domain.
 
 ## Quick start for a new domain
 
-1. **Copy** one of the templates in this folder:
+1. **Copy** the template in this folder:
 
    ```bash
-   cp deployments/mosdac.env       .env
-   # — or —
    cp deployments/generic.env      .env
    ```
 
@@ -19,7 +17,6 @@ new domain.
    (`NEO4J_PASSWORD`, optional `LONGCAT_API_KEY` / `NVIDIA_API_KEY`).
 
 3. **Pick a widget integration** from `deployments/widget-snippets/`:
-   - `mosdac.html`  — drop-in for MOSDAC portal
    - `generic.html` — minimal example with customisable branding
 
 4. **Run**:

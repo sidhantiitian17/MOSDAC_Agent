@@ -3,13 +3,32 @@ FROM python:3.11-slim
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    tesseract-ocr poppler-utils libgl1 \
+    tesseract-ocr \
+    tesseract-ocr-eng \
+    libtesseract-dev \
+    libleptonica-dev \
+    poppler-utils \
+    libgl1 \
+    libglib2.0-0 \
+    libgomp1 \
     && rm -rf /var/lib/apt/lists/*
+
+# Tesseract data path (Debian slim) — used by TesseractCliOcrOptions.
+ENV TESSDATA_PREFIX=/usr/share/tesseract-ocr/5/tessdata
+# Bound CPU thread oversubscription during batch parsing (no GPU in this deployment).
+ENV OMP_NUM_THREADS=4
 
 COPY requirement.txt .
 RUN pip install --no-cache-dir -r requirement.txt \
     fastapi "uvicorn[standard]" \
  && python -m spacy download en_core_web_sm
+
+
+ ENV HF_HOME=/app/.cache/huggingface
+# Pre-download Docling models into the image (offline / air-gapped readiness).
+# Caches layout, TableFormer, and CodeFormula models so first parse needs no network.
+RUN docling-tools models download \
+ && python -c "from docling.document_converter import DocumentConverter; print('docling OK')"
 
 COPY . .
 

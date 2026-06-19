@@ -11,6 +11,8 @@ from unittest.mock import MagicMock
 import pytest
 from fastapi.testclient import TestClient
 
+from graph_rag.retrieval.vector_retriever import VectorHit
+
 
 # ── chat_api/session.py ──────────────────────────────────────────────────────
 
@@ -120,13 +122,21 @@ def test_config_empty_headers_falls_back_to_wildcard():
 # ── chat_api/service.py ──────────────────────────────────────────────────────
 
 def _make_service(text_response="text-answer", image_response="image-answer"):
+    """Build a ChatService with a fully mocked retriever/chain/LLM.
+
+    The mock retriever now includes ``_hits`` so the grounding gate passes,
+    matching the real HybridRetriever.retrieve() contract added in guardplan.md.
+    """
     from chat_api.service import ChatService
     from chat_api.session import InMemorySessionStore
 
     retriever = MagicMock()
     retriever.retrieve.return_value = {
         "graph_context": "(A)-[REL]->(B)",
-        "vector_context": "Some passage.",
+        "vector_context": "[Source: test.pdf | score=0.9000]\nSome passage from MOSDAC documents.",
+        "_hits": [
+            VectorHit(text="Some passage from MOSDAC documents.", source="test.pdf", score=0.9, chunk_id="c1"),
+        ],
     }
     chain = MagicMock()
     chain.invoke.return_value = text_response
@@ -143,8 +153,9 @@ def _make_service(text_response="text-answer", image_response="image-answer"):
 
 def test_service_text_chat_uses_chain_and_records_history():
     service, _retriever, chain, _llm, sessions = _make_service()
-    out = service.chat(session_id="s1", message="What is X?")
-    assert out == "text-answer"
+    answer, _citations, _grounded, refused = service.chat(session_id="s1", message="What is X?")
+    assert answer == "text-answer"
+    assert not refused
     chain.invoke.assert_called_once()
     turns = sessions.get("s1")
     assert turns[0] == {"role": "user", "content": "What is X?"}
@@ -154,13 +165,14 @@ def test_service_text_chat_uses_chain_and_records_history():
 def test_service_image_chat_uses_llm_directly():
     service, retriever, chain, llm, _sessions = _make_service()
     b64 = base64.b64encode(b"fake-image-bytes").decode()
-    out = service.chat(
+    answer, _citations, _grounded, refused = service.chat(
         session_id="s2",
         message="What is on screen?",
         screenshot_b64=b64,
         screenshot_mime="image/png",
     )
-    assert out == "image-answer"
+    assert answer == "image-answer"
+    assert not refused
     chain.invoke.assert_not_called()
     llm.invoke.assert_called_once()
     retriever.retrieve.assert_called_once_with("What is on screen?")
@@ -178,12 +190,13 @@ def test_service_rejects_oversized_screenshot(monkeypatch):
     service, _, _, _, _ = _make_service()
     big = base64.b64encode(b"x" * 500).decode()
     with pytest.raises(ValueError, match="too large"):
-        service.chat(session_id="s", message="m", screenshot_b64=big)
+        # Message must be >1 char to pass L1 empty-input check
+        service.chat(session_id="s", message="What is shown here?", screenshot_b64=big)
 
 
 def test_service_clears_session():
     service, _, _, _, sessions = _make_service()
-    service.chat(session_id="s", message="hi")
+    service.chat(session_id="s", message="hi there")
     assert sessions.get("s")
     service.clear_session("s")
     assert sessions.get("s") == []
@@ -192,9 +205,9 @@ def test_service_clears_session():
 def test_service_history_prefix_grows_with_turns():
     service, _, chain, _, _ = _make_service()
     chain.invoke.side_effect = ["a1", "a2", "a3"]
-    service.chat("s", "q1")
-    service.chat("s", "q2")
-    service.chat("s", "q3")
+    service.chat("s", "q1 about MOSDAC")
+    service.chat("s", "q2 about INSAT")
+    service.chat("s", "q3 about Oceansat")
     last_call = chain.invoke.call_args_list[-1][0][0]
     assert "Conversation so far:" in last_call["history"]
     assert "q1" in last_call["history"]
@@ -209,7 +222,11 @@ def test_client():
     from chat_api.session import InMemorySessionStore
 
     retriever = MagicMock()
-    retriever.retrieve.return_value = {"graph_context": "g", "vector_context": "v"}
+    retriever.retrieve.return_value = {
+        "graph_context": "g",
+        "vector_context": "[Source: test.pdf | score=0.9000]\nMOSDAC passage.",
+        "_hits": [VectorHit(text="MOSDAC passage.", source="test.pdf", score=0.9, chunk_id="c1")],
+    }
     chain = MagicMock()
     chain.invoke.return_value = "mock-answer"
     llm = MagicMock()
@@ -242,7 +259,7 @@ def test_config_endpoint(test_client):
 
 def test_chat_text_only_endpoint(test_client):
     client, sessions = test_client
-    r = client.post("/chat", json={"session_id": "u1", "message": "hi"})
+    r = client.post("/chat", json={"session_id": "u1", "message": "hi there"})
     assert r.status_code == 200
     body = r.json()
     assert body["answer"] == "mock-answer"
@@ -252,7 +269,7 @@ def test_chat_text_only_endpoint(test_client):
 
 def test_chat_clear_endpoint(test_client):
     client, sessions = test_client
-    client.post("/chat", json={"session_id": "u2", "message": "hi"})
+    client.post("/chat", json={"session_id": "u2", "message": "hi there"})
     assert sessions.get("u2")
     r = client.delete("/chat/u2")
     assert r.status_code == 200
@@ -263,7 +280,7 @@ def test_chat_bad_request_on_invalid_screenshot(test_client):
     client, _ = test_client
     r = client.post("/chat", json={
         "session_id": "u3",
-        "message": "look",
+        "message": "look at this",
         "screenshot_base64": "!!!!notbase64!!!",
     })
     assert r.status_code == 400

@@ -22,6 +22,8 @@ class SessionStore(Protocol):
     def append(self, session_id: str, role: str, content: str) -> None: ...
     def clear(self, session_id: str) -> None: ...
     def trim(self, session_id: str, max_turns: int) -> None: ...
+    def get_summary(self, session_id: str) -> str: ...
+    def set_summary(self, session_id: str, summary: str) -> None: ...
 
 
 class InMemorySessionStore:
@@ -29,6 +31,7 @@ class InMemorySessionStore:
 
     def __init__(self) -> None:
         self._sessions: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        self._summaries: Dict[str, str] = {}
 
     def get(self, session_id: str) -> List[Dict[str, Any]]:
         return self._sessions[session_id]
@@ -38,10 +41,17 @@ class InMemorySessionStore:
 
     def clear(self, session_id: str) -> None:
         self._sessions.pop(session_id, None)
+        self._summaries.pop(session_id, None)
 
     def trim(self, session_id: str, max_turns: int) -> None:
         if len(self._sessions[session_id]) > max_turns * 2:
             self._sessions[session_id] = self._sessions[session_id][-max_turns * 2:]
+
+    def get_summary(self, session_id: str) -> str:
+        return self._summaries.get(session_id, "")
+
+    def set_summary(self, session_id: str, summary: str) -> None:
+        self._summaries[session_id] = summary
 
 
 class RedisSessionStore:
@@ -64,6 +74,9 @@ class RedisSessionStore:
     def _key(self, session_id: str) -> str:
         return f"{self._key_prefix}{session_id}"
 
+    def _summary_key(self, session_id: str) -> str:
+        return f"{self._key_prefix}{session_id}:summary"
+
     def get(self, session_id: str) -> List[Dict[str, Any]]:
         raw = self._client.lrange(self._key(session_id), 0, -1)
         return [json.loads(r) for r in raw]
@@ -73,9 +86,16 @@ class RedisSessionStore:
 
     def clear(self, session_id: str) -> None:
         self._client.delete(self._key(session_id))
+        self._client.delete(self._summary_key(session_id))
 
     def trim(self, session_id: str, max_turns: int) -> None:
         self._client.ltrim(self._key(session_id), -max_turns * 2, -1)
+
+    def get_summary(self, session_id: str) -> str:
+        return self._client.get(self._summary_key(session_id)) or ""
+
+    def set_summary(self, session_id: str, summary: str) -> None:
+        self._client.set(self._summary_key(session_id), summary)
 
 
 def build_session_store() -> SessionStore:

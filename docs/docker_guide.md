@@ -23,15 +23,14 @@ docker compose up
 4. [The existing Docker files in this project](#4-existing-docker-files)
 5. [Environment variables — the .env file](#5-environment-variables)
 6. [Run the basic stack (3 services)](#6-run-the-basic-stack)
-7. [Add the MCP server, Streamlit UI, and mock MOSDAC](#7-extended-stack)
-8. [All essential Docker commands](#8-all-docker-commands)
-9. [Understanding volumes and data persistence](#9-volumes-and-data-persistence)
-10. [Understanding networks — how containers talk](#10-networks)
-11. [How to modify the setup](#11-how-to-modify)
-12. [Running individual containers without Compose](#12-run-without-compose)
-13. [GPU support for Ollama](#13-gpu-support)
-14. [Troubleshooting common problems](#14-troubleshooting)
-15. [Production checklist](#15-production-checklist)
+7. [All essential Docker commands](#7-all-docker-commands)
+8. [Understanding volumes and data persistence](#8-volumes-and-data-persistence)
+9. [Understanding networks — how containers talk](#9-networks)
+10. [How to modify the setup](#10-how-to-modify)
+11. [Running individual containers without Compose](#11-run-without-compose)
+12. [GPU support for Ollama](#12-gpu-support)
+13. [Troubleshooting common problems](#13-troubleshooting)
+14. [Production checklist](#14-production-checklist)
 
 ---
 
@@ -79,7 +78,7 @@ This project has many moving parts:
 - Neo4j graph database
 - Ollama LLM server
 - ChromaDB vector store
-- Optional: Redis, Streamlit, MCP server
+- Optional: Redis
 
 Without Docker, you would need to install all of them manually and hope they do not
 conflict with other software on your machine. With Docker Compose, you type one
@@ -486,9 +485,6 @@ curl http://localhost:8000/health
 curl -X POST http://localhost:8000/chat \
   -H "Content-Type: application/json" \
   -d '{"session_id":"test","message":"What is MOSDAC?"}'
-
-# MOSDAC agent health (if MOSDAC_ENABLE_MOSDAC_ENDPOINT=true)
-curl http://localhost:8000/mosdac/health
 ```
 
 ### Step 8 — Open the Neo4j Browser
@@ -516,192 +512,7 @@ docker compose down -v
 
 ---
 
-## 7. Extended Stack
-
-The basic `docker-compose.yml` has three services. This section adds three more:
-the Streamlit UI, the MCP server, and the mock MOSDAC backend.
-
-### New Dockerfiles needed
-
-Create two additional Dockerfiles in the project root.
-
-#### `Dockerfile.streamlit`
-
-```dockerfile
-FROM python:3.11-slim
-WORKDIR /app
-COPY requirement.txt .
-RUN pip install --no-cache-dir streamlit requests pydantic-settings
-COPY mosdac_agent/ ./mosdac_agent/
-CMD ["streamlit", "run", "mosdac_agent/streamlit_app.py", \
-     "--server.address", "0.0.0.0", \
-     "--server.port", "8501"]
-```
-
-#### `Dockerfile.mcp`
-
-```dockerfile
-FROM python:3.11-slim
-WORKDIR /app
-COPY requirement.txt .
-RUN pip install --no-cache-dir fastmcp pydantic-settings httpx
-COPY mosdac_agent/ ./mosdac_agent/
-CMD ["python", "-m", "mosdac_agent.mcp_server"]
-```
-
-### Extended `docker-compose.yml`
-
-Replace the existing `docker-compose.yml` with this full version:
-
-```yaml
-version: "3.9"
-
-services:
-
-  # -- 1. Qwen LLM via Ollama ------------------------------------------
-  ollama:
-    image: ollama/ollama:latest
-    container_name: mosdac_ollama
-    restart: unless-stopped
-    ports:
-      - "11434:11434"
-    volumes:
-      - ollama_data:/root/.ollama
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - capabilities: [gpu]
-
-  # -- 2. Neo4j Knowledge Graph ----------------------------------------
-  neo4j:
-    image: neo4j:2025.04.0-community
-    container_name: mosdac_neo4j
-    restart: unless-stopped
-    ports:
-      - "7474:7474"
-      - "7687:7687"
-    environment:
-      NEO4J_AUTH: "neo4j/${NEO4J_PASSWORD}"
-      NEO4J_server_memory_heap_max__size: "2G"
-    volumes:
-      - neo4j_data:/data
-      - neo4j_logs:/logs
-    healthcheck:
-      test: ["CMD", "cypher-shell", "-u", "neo4j", "-p", "${NEO4J_PASSWORD}", "RETURN 1"]
-      interval: 15s
-      timeout: 10s
-      retries: 10
-
-  # -- 3. FastAPI Chat Gateway -----------------------------------------
-  chat_api:
-    build:
-      context: .
-      dockerfile: Dockerfile.api
-    container_name: mosdac_chat_api
-    restart: unless-stopped
-    ports:
-      - "8000:8000"
-    env_file:
-      - .env
-    depends_on:
-      neo4j:
-        condition: service_healthy
-      ollama:
-        condition: service_started
-    volumes:
-      - ./chroma_db:/app/chroma_db
-      - ./prompts:/app/prompts
-      - ${DOWNLOADS_DIR}:/app/downloads:ro
-      - ${ATLASES_DIR}:/app/atlases:ro
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "50m"
-        max-file: "5"
-
-  # -- 4. Fake MOSDAC backend (offline testing) -----------------------
-  mock_mosdac:
-    build:
-      context: .
-      dockerfile: Dockerfile.api
-    container_name: mosdac_mock_backend
-    restart: unless-stopped
-    ports:
-      - "9000:9000"
-    command: ["uvicorn", "mosdac_agent.mock_mosdac:app",
-              "--host", "0.0.0.0", "--port", "9000"]
-    env_file:
-      - .env
-
-  # -- 5. MCP tool server ----------------------------------------------
-  mcp_server:
-    build:
-      context: .
-      dockerfile: Dockerfile.mcp
-    container_name: mosdac_mcp
-    restart: unless-stopped
-    ports:
-      - "8765:8765"
-    env_file:
-      - .env
-    environment:
-      MCP_TRANSPORT: "streamable-http"
-      MCP_HOST: "0.0.0.0"
-      MCP_PORT: "8765"
-    depends_on:
-      - chat_api
-
-  # -- 6. Streamlit chat UI --------------------------------------------
-  streamlit:
-    build:
-      context: .
-      dockerfile: Dockerfile.streamlit
-    container_name: mosdac_streamlit
-    restart: unless-stopped
-    ports:
-      - "8501:8501"
-    env_file:
-      - .env
-    environment:
-      CHAT_API: "http://chat_api:8000/mosdac/chat"
-      MOSDAC_USER: "dev"
-    depends_on:
-      - chat_api
-
-volumes:
-  ollama_data:
-  neo4j_data:
-  neo4j_logs:
-```
-
-### Start the extended stack
-
-```bash
-# Build all new images:
-docker compose build
-
-# Start everything:
-docker compose up -d
-
-# Check all 6 containers:
-docker compose ps
-```
-
-Service summary:
-
-| Container | URL in browser | What it is |
-|-----------|---------------|------------|
-| `mosdac_chat_api` | http://localhost:8000 | FastAPI (GraphRAG + MOSDAC agent) |
-| `mosdac_neo4j` | http://localhost:7474 | Neo4j Browser |
-| `mosdac_ollama` | http://localhost:11434 | Ollama LLM API |
-| `mosdac_mock_backend` | http://localhost:9000 | Fake MOSDAC API |
-| `mosdac_mcp` | http://localhost:8765/mcp | MCP tool server |
-| `mosdac_streamlit` | http://localhost:8501 | Streamlit chat UI |
-
----
-
-## 8. All Docker Commands
+## 7. All Docker Commands
 
 ### Building images
 
@@ -823,7 +634,7 @@ docker system prune -a --volumes
 
 ---
 
-## 9. Volumes and Data Persistence
+## 8. Volumes and Data Persistence
 
 ### Why volumes matter
 
@@ -897,7 +708,7 @@ docker run --rm \
 
 ---
 
-## 10. Networks
+## 9. Networks
 
 ### How containers talk to each other
 
@@ -909,7 +720,6 @@ Every service can reach every other service by its **service name**:
 ```
 chat_api  ---->  neo4j:7687       (connect to neo4j service on port 7687)
 chat_api  ---->  ollama:11434     (connect to ollama service on port 11434)
-streamlit ---->  chat_api:8000   (connect to chat_api service on port 8000)
 ```
 
 This is why `.env` uses `NEO4J_URI=bolt://neo4j:7687` and not `localhost:7687`.
@@ -940,7 +750,7 @@ but you reach it from your laptop at http://localhost:9999.
 
 ---
 
-## 11. How to Modify the Setup
+## 10. How to Modify the Setup
 
 ### Change a port
 
@@ -1124,7 +934,7 @@ ChromaDB data is stored in `./chroma_db` by default. To move it:
 
 ---
 
-## 12. Run Without Compose (Individual Containers)
+## 11. Run Without Compose (Individual Containers)
 
 Sometimes you want to run just one container manually to test something.
 
@@ -1185,7 +995,7 @@ docker run -d \
 
 ---
 
-## 13. GPU Support for Ollama
+## 12. GPU Support for Ollama
 
 By default, Docker containers cannot see your GPU. The `docker-compose.yml`
 already requests GPU access for the Ollama service:
@@ -1254,7 +1064,7 @@ docker exec mosdac_ollama ollama pull qwen2.5:3b   # smallest option
 
 ---
 
-## 14. Troubleshooting Common Problems
+## 13. Troubleshooting Common Problems
 
 ### "Port is already allocated"
 
@@ -1400,7 +1210,7 @@ exit                       # leave the shell
 
 ---
 
-## 15. Production Checklist
+## 14. Production Checklist
 
 Before deploying to a real server, go through this list.
 
@@ -1497,13 +1307,10 @@ docker system prune -a --volumes  # remove everything (destructive)
 
 | Service | Host port | Container port | URL in browser |
 |---------|-----------|----------------|----------------|
-| FastAPI (chat + MOSDAC) | 8000 | 8000 | http://localhost:8000 |
+| FastAPI chat gateway | 8000 | 8000 | http://localhost:8000 |
 | Neo4j Browser | 7474 | 7474 | http://localhost:7474 |
 | Neo4j Bolt driver | 7687 | 7687 | bolt://localhost:7687 |
 | Ollama LLM API | 11434 | 11434 | http://localhost:11434 |
-| Mock MOSDAC backend | 9000 | 9000 | http://localhost:9000 |
-| MCP tool server | 8765 | 8765 | http://localhost:8765/mcp |
-| Streamlit UI | 8501 | 8501 | http://localhost:8501 |
 
 ---
 

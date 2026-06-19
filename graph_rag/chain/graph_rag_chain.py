@@ -39,10 +39,14 @@ def _load_system_prompt() -> str:
 HUMAN_TEMPLATE = """{history}{question}"""
 
 
-def build_graph_rag_chain(retriever: HybridRetriever | None = None, llm=None):
+def build_graph_rag_chain(retriever: HybridRetriever | None = None, llm=None, contextualizer=None):
     """Construct the LCEL chain. Returns a runnable accepting {'question': str, 'history': str}."""
     retriever = retriever or HybridRetriever()
     llm = llm or get_llm()
+    if contextualizer is None:
+        from graph_rag.retrieval.query_contextualizer import QueryContextualizer
+
+        contextualizer = QueryContextualizer()
 
     system_text = _load_system_prompt()
 
@@ -54,10 +58,13 @@ def build_graph_rag_chain(retriever: HybridRetriever | None = None, llm=None):
     )
 
     def _retrieve(payload: dict) -> dict:
-        # Retrieve using only the current question so history doesn't dilute the embedding
         question = payload["question"]
-        ctx = retriever.retrieve(question)
         history = payload.get("history", "")
+        # History-aware retrieval: rewrite a follow-up into a standalone query so
+        # retrieval targets the right entity. The user's literal question (below)
+        # is unchanged — only the search query is contextualized.
+        search_query = contextualizer.contextualize(question, history).search_query
+        ctx = retriever.retrieve(search_query)
         return {
             "graph_context": ctx["graph_context"],
             "vector_context": ctx["vector_context"],

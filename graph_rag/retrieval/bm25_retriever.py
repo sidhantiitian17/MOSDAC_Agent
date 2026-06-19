@@ -34,7 +34,7 @@ class BM25Retriever:
     @property
     def store(self) -> ChromaStore:
         if self._store is None:
-            from graph_rag.embeddings.nomic_embedder import get_embedder
+            from graph_rag.embeddings import get_embedder
             self._store = ChromaStore(embedder=get_embedder())
         return self._store
 

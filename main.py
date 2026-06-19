@@ -1,31 +1,78 @@
 """Graph RAG Chatbot — CLI entry point.
 
 Commands:
-    python main.py ingest     # run full ingestion pipeline (load -> embed -> KG)
-    python main.py chat       # interactive REPL
-    python main.py test       # health-check every component
+    python main.py ingest                  # incremental ingestion (files + Drupal if URL set)
+    python main.py ingest --force          # re-ingest every file, ignoring the content-hash manifest
+    python main.py ingest --skip-drupal    # file ingestion only, skip Drupal even if URL is set
+    python main.py ingest --skip-files     # Drupal ingestion only, skip file discovery
+    python main.py ingest --skip-vector    # KG only, no Chroma writes
+    python main.py ingest --skip-graph     # Chroma only, no Neo4j writes
+    python main.py chat                    # interactive REPL
+    python main.py test                    # health-check every component
+    python main.py eval                    # run the evaluation harness (Phase 0)
+    python main.py build-communities       # build GraphRAG community summaries (Phase 6)
 """
 from __future__ import annotations
 
 import logging
 import sys
 
+# Force UTF-8 output on all platforms (prevents UnicodeEncodeError on Windows
+# when stdout is redirected to a file/pipe and locale is cp1252).
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s | %(message)s")
 logger = logging.getLogger("graph_rag.main")
 
 
 def cmd_ingest(argv: list[str] | None = None) -> int:
-    """Run ingestion. Flags: --skip-vector, --skip-graph"""
+    """Run ingestion. Flags: --skip-vector, --skip-graph, --force, --skip-drupal, --skip-files"""
+    import os
+    from dotenv import load_dotenv
     from graph_rag.ingestion.pipeline import IngestionPipeline
 
+    load_dotenv()
+
     argv = argv or []
-    pipeline = IngestionPipeline(
-        skip_vector="--skip-vector" in argv,
-        skip_graph="--skip-graph" in argv,
-    )
-    stats = pipeline.run()
-    print(stats.summary())
-    return 0 if not stats.errors else 1
+    skip_files = "--skip-files" in argv
+    stats = None
+
+    # ── Step 1: file-based ingestion (HTML + PDF) ────────────────────────────
+    if not skip_files:
+        pipeline = IngestionPipeline(
+            skip_vector="--skip-vector" in argv,
+            skip_graph="--skip-graph" in argv,
+            force="--force" in argv,
+        )
+        stats = pipeline.run()
+        print(stats.summary())
+    else:
+        print("(File ingestion skipped via --skip-files)")
+
+    # ── Step 2: Drupal ingestion (auto when DRUPAL_JSONAPI_URL is set) ────────
+    drupal_url = os.getenv("DRUPAL_JSONAPI_URL", "").strip()
+    skip_drupal = "--skip-drupal" in argv
+
+    if drupal_url and not skip_drupal:
+        print("\n── Drupal ingestion ──────────────────────────────────────────")
+        try:
+            from drupal_ingest import DrupalConfig, run as drupal_run
+            d_stats = drupal_run(DrupalConfig.from_env())
+            print(
+                f"Drupal: scanned {d_stats['scanned']} | "
+                f"new {d_stats['new']} | updated {d_stats['updated']} | "
+                f"skipped {d_stats['skipped']} | errors {d_stats['errors']}"
+            )
+        except Exception as exc:
+            print(f"Drupal ingestion failed: {exc}")
+    elif skip_drupal:
+        print("\n(Drupal ingestion skipped via --skip-drupal)")
+    else:
+        print("\n(DRUPAL_JSONAPI_URL not set — Drupal ingestion skipped)")
+
+    return 0 if (stats is None or not stats.errors) else 1
 
 
 def cmd_chat() -> int:
@@ -60,8 +107,8 @@ def cmd_test() -> int:
     print("Checking configuration...")
     print(f"  TABBY_MODEL            = {settings.tabby_model}")
     print(f"  TABBY_BASE_URL         = {settings.tabby_base_url}")
-    print(f"  NOMIC_MODEL_NAME       = {settings.nomic_model_name}")
-    print(f"  NOMIC_BASE_URL         = {settings.nomic_base_url}")
+    print(f"  OLLAMA_BASE_URL        = {settings.ollama_base_url}")
+    print(f"  OLLAMA_EMBEDDING_MODEL = {settings.ollama_embedding_model}")
     print(f"  NEO4J_URI              = {settings.neo4j_uri}")
     print(f"  CHROMA_PERSIST_DIR     = {settings.chroma_persist_dir}")
     print(f"  DOWNLOADS_DIR          = {settings.downloads_dir}")
@@ -79,7 +126,7 @@ def cmd_test() -> int:
 
     print("\nChecking embedder...")
     try:
-        from graph_rag.embeddings.nomic_embedder import get_embedder
+        from graph_rag.embeddings import get_embedder
 
         emb = get_embedder()
         vec = emb.embed_query("hello world")
@@ -91,7 +138,7 @@ def cmd_test() -> int:
     print("\nChecking ChromaDB...")
     try:
         from graph_rag.vector_store.chroma_store import ChromaStore
-        from graph_rag.embeddings.nomic_embedder import get_embedder
+        from graph_rag.embeddings import get_embedder
 
         store = ChromaStore(embedder=get_embedder())
         print(f"  count = {store.count()}")
@@ -140,6 +187,52 @@ def cmd_test() -> int:
     return 0 if ok else 1
 
 
+def cmd_eval(argv: list[str] | None = None) -> int:
+    """Run the evaluation harness. Flags: --limit N, --no-judge, --out PATH, --set PATH"""
+    from graph_rag.eval.harness import DEFAULT_QUESTION_SET, EvalHarness
+
+    argv = argv or []
+    limit: int | None = None
+    out = "eval_results.md"
+    qset = DEFAULT_QUESTION_SET
+    use_judge = "--no-judge" not in argv
+    for i, a in enumerate(argv):
+        if a == "--limit" and i + 1 < len(argv):
+            limit = int(argv[i + 1])
+        elif a == "--out" and i + 1 < len(argv):
+            out = argv[i + 1]
+        elif a == "--set" and i + 1 < len(argv):
+            qset = argv[i + 1]
+
+    harness = EvalHarness(use_judge=use_judge)
+    questions = harness.load(qset)
+    n = len(questions) if limit is None else min(limit, len(questions))
+    print(f"Running eval on {n} question(s) (judge={'on' if use_judge else 'off'})...")
+    results = harness.run(questions, limit=limit)
+    print("\n" + harness.scorecard(results))
+    harness.save_markdown(results, out)
+    print(f"\nSaved detailed results to {out}")
+    return 0
+
+
+def cmd_build_communities(argv: list[str] | None = None) -> int:
+    """Build GraphRAG community summaries. Flags: --limit N, --min-degree N"""
+    from graph_rag.knowledge_graph.community import CommunitySummarizer
+
+    argv = argv or []
+    limit: int | None = None
+    min_degree: int | None = None
+    for i, a in enumerate(argv):
+        if a == "--limit" and i + 1 < len(argv):
+            limit = int(argv[i + 1])
+        elif a == "--min-degree" and i + 1 < len(argv):
+            min_degree = int(argv[i + 1])
+
+    count = CommunitySummarizer().build(limit=limit, min_degree=min_degree)
+    print(f"Built {count} community summaries.")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = argv or sys.argv[1:]
     if not argv:
@@ -152,6 +245,10 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_chat()
     if cmd == "test":
         return cmd_test()
+    if cmd == "eval":
+        return cmd_eval(argv[1:])
+    if cmd == "build-communities":
+        return cmd_build_communities(argv[1:])
     print(f"Unknown command: {cmd}")
     print(__doc__)
     return 2

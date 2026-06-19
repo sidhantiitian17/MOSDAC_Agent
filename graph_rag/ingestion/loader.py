@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import Iterator
 
 from langchain_core.documents import Document
 
 from graph_rag.config import settings
+from graph_rag.ingestion.manifest import IngestionManifest, compute_file_hash
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +20,7 @@ logging.getLogger("pypdf._reader").setLevel(logging.ERROR)
 PDF_SUFFIXES = {".pdf"}
 HTML_SUFFIXES = {".html", ".htm", ".xhtml"}
 TEXT_SUFFIXES = {".txt", ".md"}
+SUPPORTED_SUFFIXES = PDF_SUFFIXES | HTML_SUFFIXES | TEXT_SUFFIXES
 
 
 def _mute_fitz_stderr() -> None:
@@ -52,7 +55,44 @@ def _has_fitz_format_errors(path: Path) -> bool:
         return True  # fitz couldn't even open it — definitely has errors
 
 
+def _docling_eligible(path: Path) -> bool:
+    """Skip Docling for oversized files — route to the streaming OCR fallback instead."""
+    try:
+        size_mb = path.stat().st_size / (1024 * 1024)
+    except OSError:
+        return False
+    if size_mb > settings.docling_max_file_mb:
+        logger.info(
+            "Skipping Docling for %s (%.0f MB > %d MB cap)",
+            path.name, size_mb, settings.docling_max_file_mb,
+        )
+        return False
+    return True
+
+
 def _load_pdf(path: Path) -> list[Document]:
+    # ── Primary: Docling — structured Markdown with math + tables + OCR ────────
+    if settings.use_docling and _docling_eligible(path):
+        try:
+            from graph_rag.ingestion.docling_parser import parse_pdf_to_markdown
+            from graph_rag.preprocessing.preprocessor import (
+                chunk_markdown,
+                clean_markdown,
+                enrich_chunks,
+            )
+            markdown = parse_pdf_to_markdown(path)
+            # Apply the preprocessing layer: LaTeX-safe regex clean → header split
+            # → metadata enrichment. Returns pre-chunked docs tagged pre_chunked=True
+            # so split_documents() passes them through without re-splitting.
+            markdown = clean_markdown(markdown)
+            chunks = chunk_markdown(markdown)
+            return enrich_chunks(chunks, path, "pdf")
+        except Exception as exc:
+            logger.warning(
+                "Docling failed for %s (%s) — falling back to cascade", path.name, exc
+            )
+
+    # ── Fallback: pypdf → PyMuPDF → OCR cascade (unchanged) ─────────────────
     # Fast pre-check: if fitz reports format errors, pypdf will hang on the same
     # file for minutes. Skip it and go straight to the PyMuPDF recovery path.
     if _has_fitz_format_errors(path):
@@ -158,17 +198,14 @@ def _ocr_via_pdf2image(path: Path) -> list[Document]:
 
 
 def _load_html(path: Path) -> list[Document]:
+    # Delegate to the full preprocessing pipeline: BS4 junk filter → Docling
+    # → LaTeX-safe regex clean → MarkdownHeaderTextSplitter → metadata enrichment.
+    # This preserves heading/table structure that the old get_text() path lost.
     try:
-        from bs4 import BeautifulSoup
-
-        with path.open("r", encoding="utf-8", errors="ignore") as fh:
-            soup = BeautifulSoup(fh.read(), "lxml")
-        for tag in soup(["script", "style", "noscript"]):
-            tag.decompose()
-        text = soup.get_text(separator="\n", strip=True)
-        return [Document(page_content=text, metadata={})] if text else []
+        from graph_rag.preprocessing.preprocessor import preprocess_file
+        return preprocess_file(path)
     except Exception as exc:
-        logger.warning("Failed to load HTML %s: %s", path, exc)
+        logger.warning("Preprocessing failed for HTML %s (%s) — skipping", path.name, exc)
         return []
 
 
@@ -203,16 +240,60 @@ def load_file(path: Path) -> list[Document]:
     return docs
 
 
-def load_all_documents(folders: list[Path] | None = None) -> list[Document]:
-    """Walk every configured folder; load every PDF/HTML/text file."""
+def iter_source_files(folders: list[Path] | None = None) -> Iterator[Path]:
+    """Yield every supported (PDF/HTML/text) file under the configured folders."""
     folders = folders or settings.source_folders()
-    all_docs: list[Document] = []
     for folder in folders:
         if not folder.exists():
             logger.warning("Source folder does not exist: %s", folder)
             continue
         for path in folder.rglob("*"):
-            if path.is_file():
-                all_docs.extend(load_file(path))
-    logger.info("Loaded %d documents from %s", len(all_docs), folders)
+            if path.is_file() and path.suffix.lower() in SUPPORTED_SUFFIXES:
+                yield path
+
+
+def load_all_documents(
+    folders: list[Path] | None = None,
+    *,
+    manifest: IngestionManifest | None = None,
+    force: bool = False,
+) -> list[Document]:
+    """Walk every configured folder; load every PDF/HTML/text file.
+
+    When `manifest` is provided (and `force` is False), a file whose SHA-256 content
+    hash is already recorded is skipped entirely — never opened, parsed, or OCR'd.
+    Every loaded Document is tagged with `metadata["file_hash"]` so the pipeline can
+    record the file as ingested once the run completes. With `manifest=None` the
+    behaviour is identical to a plain recursive load (no hashing, no `file_hash` tag).
+    """
+    all_docs: list[Document] = []
+    new_files = 0
+    skipped = 0
+    for path in iter_source_files(folders):
+        file_hash: str | None = None
+        if manifest is not None:
+            file_hash = compute_file_hash(path)
+            if not force and manifest.is_ingested(file_hash):
+                skipped += 1
+                logger.debug("Skipping already-ingested file: %s (%s…)", path.name, file_hash[:12])
+                continue
+
+        loaded = load_file(path)
+        if not loaded:
+            continue
+        if file_hash:
+            for d in loaded:
+                d.metadata["file_hash"] = file_hash
+        all_docs.extend(loaded)
+        new_files += 1
+
+    if manifest is not None:
+        logger.info(
+            "Loaded %d documents from %d new file(s); skipped %d already-ingested file(s).",
+            len(all_docs),
+            new_files,
+            skipped,
+        )
+    else:
+        logger.info("Loaded %d documents from %d file(s).", len(all_docs), new_files)
     return all_docs
