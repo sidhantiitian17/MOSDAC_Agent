@@ -54,14 +54,19 @@ class ChatService:
         llm,
         sessions: SessionStore,
         max_history: Optional[int] = None,
+        repo=None,
     ) -> None:
         self._retriever = retriever
         self._chain = chain
         self._llm = llm
         self._sessions = sessions
+        # Conversation store for per-user persisted history (None = persistence off,
+        # every request behaves like an anonymous ephemeral session).
+        self._repo = repo
         self._max_history = max_history if max_history is not None else chat_api_settings.max_history_turns
         self._contextualizer = None
         self._summarizer = None
+        self._titler = None
         self._answer_cache = None
         if chat_api_settings.enable_answer_cache:
             from chat_api.answer_cache import AnswerCache
@@ -86,6 +91,12 @@ class ChatService:
             self._summarizer = ConversationSummarizer()
         return self._summarizer
 
+    def _get_titler(self):
+        if self._titler is None:
+            from chat_api.titler import ConversationTitler
+            self._titler = ConversationTitler()
+        return self._titler
+
     def _remember_overflow(self, session_id: str) -> None:
         if not graph_settings.enable_conversation_summary:
             self._sessions.trim(session_id, self._max_history)
@@ -99,11 +110,13 @@ class ChatService:
         self._sessions.set_summary(session_id, summary)
         self._sessions.trim(session_id, keep)
 
-    def _build_history_prefix(self, session_id: str) -> str:
-        turns = self._sessions.get(session_id)
-        summary = ""
-        if graph_settings.enable_conversation_summary:
-            summary = self._sessions.get_summary(session_id)
+    @staticmethod
+    def _format_history_prefix(turns: List[Dict[str, Any]], summary: str = "") -> str:
+        """Render a list of {role, content} turns into the prompt history prefix.
+
+        Shared by the ephemeral session-store path and the persisted per-user
+        conversation path so both produce an identical prompt shape.
+        """
         if not turns and not summary:
             return ""
         lines: List[str] = []
@@ -114,6 +127,19 @@ class ChatService:
             content = t["content"] if isinstance(t["content"], str) else "[image]"
             lines.append(f"{role}: {content}")
         return "Conversation so far:\n" + "\n".join(lines) + "\n\nNew question: "
+
+    def _build_history_prefix(self, session_id: str) -> str:
+        turns = self._sessions.get(session_id)
+        summary = ""
+        if graph_settings.enable_conversation_summary:
+            summary = self._sessions.get_summary(session_id)
+        return self._format_history_prefix(turns, summary)
+
+    def _history_prefix_from_messages(self, messages) -> str:
+        """Build the prompt prefix from persisted conversation messages (DB)."""
+        recent = messages[-self._max_history * 2:] if self._max_history else messages
+        turns = [{"role": m.role, "content": m.content} for m in recent]
+        return self._format_history_prefix(turns)
 
     def _validate_screenshot(self, screenshot_b64: str) -> None:
         if not chat_api_settings.enable_screenshot:
@@ -137,7 +163,7 @@ class ChatService:
         message: str,
         screenshot_b64: str,
         mime: str,
-        session_id: str,
+        history_prefix: str,
     ) -> Tuple[str, List[dict], bool, float]:
         """Multimodal answer path. Returns (answer, citations, grounded, top_score).
 
@@ -150,7 +176,6 @@ class ChatService:
         from graph_rag.config import settings as gs
 
         self._validate_screenshot(screenshot_b64)
-        history_prefix = self._build_history_prefix(session_id)
         search_query = self._contextualize(message, history_prefix)
         ctx = self._retriever.retrieve(search_query)
         hits = ctx.get("_hits", [])
@@ -194,7 +219,7 @@ class ChatService:
     def _answer_text_only(
         self,
         message: str,
-        session_id: str,
+        history_prefix: str,
     ) -> Tuple[str, List[dict], bool, float]:
         """
         Returns (answer, citations, grounded, top_score).
@@ -207,8 +232,6 @@ class ChatService:
 
         pipeline = get_pipeline()
         manifest_path = gs.ingest_manifest_path
-
-        history_prefix = self._build_history_prefix(session_id)
 
         # Answer cache: serve a previously grounded answer for an identical
         # (question, history, corpus) without re-running retrieval + LLM.
@@ -259,6 +282,35 @@ class ChatService:
 
         return clean_answer, citations, True, top_score
 
+    def _generate(
+        self,
+        safe_message: str,
+        history_prefix: str,
+        screenshot_b64: Optional[str],
+        screenshot_mime: Optional[str],
+    ) -> Tuple[str, List[dict], bool, bool, float]:
+        """Run the answer pipeline (image or text) given a precomputed history
+        prefix. Shared by the ephemeral and persisted chat entry points so the
+        load-bearing RAG + guardrail logic lives in exactly one place.
+
+        Returns (answer, citations, grounded, refused, top_score).
+        """
+        from guardrails.templates import REFUSAL_NO_CONTEXT
+
+        if screenshot_b64:
+            answer, citations, grounded, top_score = self._answer_with_image(
+                message=safe_message,
+                screenshot_b64=screenshot_b64,
+                mime=screenshot_mime or "image/png",
+                history_prefix=history_prefix,
+            )
+        else:
+            answer, citations, grounded, top_score = self._answer_text_only(
+                safe_message, history_prefix
+            )
+        refused = (answer == REFUSAL_NO_CONTEXT)
+        return answer, citations, grounded, refused, top_score
+
     def chat(
         self,
         session_id: str,
@@ -267,7 +319,7 @@ class ChatService:
         screenshot_mime: Optional[str] = "image/png",
     ) -> Tuple[str, List[dict], bool, bool]:
         """
-        Entry point.
+        Entry point (anonymous / ephemeral). History lives in the session store.
         Returns (answer, citations, grounded, refused).
         """
         from guardrails import get_pipeline
@@ -299,17 +351,10 @@ class ChatService:
 
         safe_message = decision.cleaned_text
 
-        if screenshot_b64:
-            answer, citations, grounded, top_score = self._answer_with_image(
-                message=safe_message,
-                screenshot_b64=screenshot_b64,
-                mime=screenshot_mime or "image/png",
-                session_id=session_id,
-            )
-            refused = (answer == REFUSAL_NO_CONTEXT)
-        else:
-            answer, citations, grounded, top_score = self._answer_text_only(safe_message, session_id)
-            refused = (answer == REFUSAL_NO_CONTEXT)
+        history_prefix = self._build_history_prefix(session_id)
+        answer, citations, grounded, refused, top_score = self._generate(
+            safe_message, history_prefix, screenshot_b64, screenshot_mime
+        )
 
         # Store only the PII-redacted message (L5)
         self._sessions.append(session_id, "user", safe_message)
@@ -332,7 +377,131 @@ class ChatService:
 
         return answer, citations, grounded, refused
 
-    def chat_stream(self, session_id: str, message: str):
+    def chat_authenticated(
+        self,
+        *,
+        user,
+        session_id: str,
+        message: str,
+        conversation_id: Optional[str] = None,
+        screenshot_b64: Optional[str] = None,
+        screenshot_mime: Optional[str] = "image/png",
+        background=None,
+    ) -> Tuple[str, List[dict], bool, bool, Optional[str]]:
+        """Authenticated, persisted chat for a single user.
+
+        Returns (answer, citations, grounded, refused, conversation_id). A new
+        conversation is created when ``conversation_id`` is None; an existing one is
+        continued only if the user owns it (else :class:`ConversationNotFoundError`).
+        The brand-new conversation gets a short LLM title generated off the request
+        path via ``background``.
+        """
+        from guardrails import get_pipeline
+        from guardrails.audit.logger import log_request
+        from guardrails.config import guardrail_settings as gcfg
+        from chat_api.db.repository import ConversationNotFoundError
+
+        # Persistence disabled → fall back to the ephemeral session-store path.
+        if self._repo is None:
+            answer, citations, grounded, refused = self.chat(
+                session_id=session_id,
+                message=message,
+                screenshot_b64=screenshot_b64,
+                screenshot_mime=screenshot_mime,
+            )
+            return answer, citations, grounded, refused, None
+
+        pipeline = get_pipeline()
+        start = time.monotonic()
+
+        # L1 input guard (abuse/audit keyed on session_id, as in the anonymous path).
+        decision = pipeline.check_input(message, session_id)
+        if decision.is_refused:
+            latency = (time.monotonic() - start) * 1000
+            if gcfg.audit:
+                log_request(
+                    session_id=session_id, action="refuse", reason_codes=decision.reasons,
+                    grounded=False, refused=True, top_score=0.0, latency_ms=latency,
+                    has_citations=False,
+                )
+            return decision.cleaned_text, [], False, True, conversation_id
+        safe_message = decision.cleaned_text
+
+        # Validate a screenshot BEFORE creating a conversation so a bad upload never
+        # leaves an empty row behind.
+        if screenshot_b64:
+            self._validate_screenshot(screenshot_b64)
+
+        # Resolve / create the conversation (ownership enforced in the repo).
+        is_new = conversation_id is None
+        if is_new:
+            conv = self._repo.create_conversation(user.id)
+            conversation_id = conv.id
+            history_prefix = ""
+        else:
+            conv = self._repo.get_conversation(user.id, conversation_id)
+            if conv is None:
+                raise ConversationNotFoundError(conversation_id)
+            history_prefix = self._history_prefix_from_messages(
+                self._repo.list_messages(user.id, conversation_id)
+            )
+
+        answer, citations, grounded, refused, top_score = self._generate(
+            safe_message, history_prefix, screenshot_b64, screenshot_mime
+        )
+
+        # Persist the turn (PII-redacted user message + assistant answer).
+        self._repo.append_message(user.id, conversation_id, "user", safe_message)
+        self._repo.append_message(user.id, conversation_id, "assistant", answer)
+
+        # Title a brand-new, answered conversation off the request path.
+        if is_new and not refused and background is not None:
+            background.add_task(
+                self._title_conversation, user.id, conversation_id, safe_message, answer
+            )
+
+        latency = (time.monotonic() - start) * 1000
+        _metric_inc("chat_requests_total", {"action": "refuse" if refused else "allow"})
+        _metric_observe("chat_request_latency_ms", latency)
+        if gcfg.audit:
+            log_request(
+                session_id=session_id, action="refuse" if refused else "allow",
+                reason_codes=[], grounded=grounded, refused=refused, top_score=top_score,
+                latency_ms=latency, has_citations=bool(citations),
+            )
+        return answer, citations, grounded, refused, conversation_id
+
+    def _title_conversation(self, user_id: str, conversation_id: str, question: str, answer: str) -> None:
+        """Background task: generate and store a short conversation title."""
+        if self._repo is None:
+            return
+        try:
+            title = self._get_titler().make_title(question, answer)
+            self._repo.update_title(user_id, conversation_id, title)
+        except Exception as exc:  # noqa: BLE001 — titling is best-effort
+            logger.info("Title update failed (%s); keeping default.", exc)
+
+    # ── Conversation management (per-user, ownership-enforced) ───────────────
+    def list_conversations(self, user_id: str, limit: int = 50):
+        if self._repo is None:
+            return []
+        return self._repo.list_conversations(user_id, limit)
+
+    def get_conversation_with_messages(self, user_id: str, conversation_id: str):
+        """Return (Conversation, [Message]) or None if not found / not owned."""
+        if self._repo is None:
+            return None
+        conv = self._repo.get_conversation(user_id, conversation_id)
+        if conv is None:
+            return None
+        return conv, self._repo.list_messages(user_id, conversation_id)
+
+    def delete_conversation(self, user_id: str, conversation_id: str) -> bool:
+        if self._repo is None:
+            return False
+        return self._repo.delete_conversation(user_id, conversation_id)
+
+    def chat_stream(self, session_id: str, message: str, user=None, conversation_id=None, background=None):
         """SSE generator (P1-6): yields ``token`` events while generating, then a
         single authoritative ``final`` event whose answer has passed the L4 guard.
 
@@ -355,12 +524,19 @@ class ChatService:
             _metric_inc("chat_requests_total", {"action": "refuse" if refused else "allow"})
             return _event("final", {
                 "answer": answer, "session_id": session_id,
+                "conversation_id": conversation_id,
                 "citations": citations, "grounded": grounded, "refused": refused,
             })
 
+        # Persisted per-user history when an authenticated user + repo are present;
+        # otherwise the ephemeral session-store path (anonymous behaviour).
+        use_db = bool(user) and self._repo is not None
+        is_new = False
+
         start = time.monotonic()
         pipeline = get_pipeline()
-        self._remember_overflow(session_id)
+        if not use_db:
+            self._remember_overflow(session_id)
 
         # L1 input guard
         decision = pipeline.check_input(message, session_id)
@@ -369,7 +545,21 @@ class ChatService:
             return
         safe_message = decision.cleaned_text
 
-        history_prefix = self._build_history_prefix(session_id)
+        # Resolve conversation + history.
+        if use_db:
+            if conversation_id is None:
+                is_new = True          # created at the end, after a successful answer
+                history_prefix = ""
+            else:
+                conv = self._repo.get_conversation(user.id, conversation_id)
+                if conv is None:
+                    yield _final("Conversation not found.", [], False, True)
+                    return
+                history_prefix = self._history_prefix_from_messages(
+                    self._repo.list_messages(user.id, conversation_id)
+                )
+        else:
+            history_prefix = self._build_history_prefix(session_id)
 
         if self._answer_cache is not None:
             cached = self._answer_cache.get(safe_message, history_prefix)
@@ -420,8 +610,19 @@ class ChatService:
         clean_answer, citations, _reasons = pipeline.check_output(raw_answer, registry, passages, context)
         refused = (clean_answer == REFUSAL_NO_CONTEXT)
 
-        self._sessions.append(session_id, "user", safe_message)
-        self._sessions.append(session_id, "assistant", clean_answer)
+        if use_db:
+            if is_new:
+                conv = self._repo.create_conversation(user.id)
+                conversation_id = conv.id
+            self._repo.append_message(user.id, conversation_id, "user", safe_message)
+            self._repo.append_message(user.id, conversation_id, "assistant", clean_answer)
+            if is_new and not refused and background is not None:
+                background.add_task(
+                    self._title_conversation, user.id, conversation_id, safe_message, clean_answer
+                )
+        else:
+            self._sessions.append(session_id, "user", safe_message)
+            self._sessions.append(session_id, "assistant", clean_answer)
         if self._answer_cache is not None and not refused:
             self._answer_cache.put(safe_message, history_prefix, clean_answer, citations)
 

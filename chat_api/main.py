@@ -33,6 +33,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from chat_api.config import chat_api_settings
+from chat_api.db import build_conversation_repository
 from chat_api.routes import build_router
 from chat_api.service import ChatService
 from chat_api.session import build_session_store
@@ -125,7 +126,7 @@ def _setup_rate_limiter(app: FastAPI) -> None:
 
 # ── Lifespan: warm caches on startup, release drivers on shutdown ─────────────
 
-def _make_lifespan(retriever):
+def _make_lifespan(retriever, repo=None):
     @contextlib.asynccontextmanager
     async def lifespan(app: FastAPI):
         if chat_api_settings.enable_screenshot and not chat_api_settings.vision_model:
@@ -152,6 +153,11 @@ def _make_lifespan(retriever):
                 if store is not None and hasattr(store, "close"):
                     store.close()
                     logger.info("Neo4j driver closed on shutdown.")
+            # Close the conversation store connection.
+            if repo is not None and hasattr(repo, "close"):
+                with contextlib.suppress(Exception):
+                    repo.close()
+                    logger.info("Conversation store closed on shutdown.")
     return lifespan
 
 
@@ -176,7 +182,10 @@ def create_app(
             chain = chain or build_graph_rag_chain(retriever=retriever)
             llm = llm or get_llm()
             sessions = sessions or build_session_store()
-            service = ChatService(retriever=retriever, chain=chain, llm=llm, sessions=sessions)
+            repo = build_conversation_repository()
+            service = ChatService(
+                retriever=retriever, chain=chain, llm=llm, sessions=sessions, repo=repo
+            )
         except Exception as exc:
             # Surface a clear, actionable boot error (P2-6) instead of an opaque
             # import-time stack trace deep in a dependency.
@@ -188,7 +197,7 @@ def create_app(
     app = FastAPI(
         title=chat_api_settings.title,
         version=chat_api_settings.version,
-        lifespan=_make_lifespan(retriever),
+        lifespan=_make_lifespan(retriever, getattr(service, "_repo", None)),
     )
 
     # L0: Security headers + body-size cap

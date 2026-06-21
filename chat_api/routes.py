@@ -2,12 +2,30 @@
 from __future__ import annotations
 
 import logging
+from typing import List, Optional
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    Header,
+    HTTPException,
+    Request,
+    Response,
+)
 from fastapi.responses import StreamingResponse
 
+from chat_api.auth import NormalizedUser, get_current_user, get_optional_user
 from chat_api.config import chat_api_settings
-from chat_api.models import ChatRequest, ChatResponse, CitationItem
+from chat_api.db.repository import ConversationNotFoundError
+from chat_api.models import (
+    ChatRequest,
+    ChatResponse,
+    CitationItem,
+    ConversationDetail,
+    ConversationOut,
+    MessageOut,
+)
 from chat_api.service import ChatService
 
 logger = logging.getLogger(__name__)
@@ -79,22 +97,45 @@ def build_router(service: ChatService) -> APIRouter:
             return Response(content=render_latest(), media_type=CONTENT_TYPE)
 
     @router.post("/chat", response_model=ChatResponse, dependencies=[Depends(_require_api_key)])
-    def chat(req: ChatRequest):
+    def chat(
+        req: ChatRequest,
+        background: BackgroundTasks,
+        user: Optional[NormalizedUser] = Depends(get_optional_user),
+    ):
         try:
-            answer, raw_citations, grounded, refused = service.chat(
-                session_id=req.session_id,
-                message=req.message,
-                screenshot_b64=req.screenshot_base64,
-                screenshot_mime=req.screenshot_mime,
-            )
+            if user is None:
+                # Anonymous / ephemeral — unchanged behaviour, no DB, no history.
+                answer, raw_citations, grounded, refused = service.chat(
+                    session_id=req.session_id,
+                    message=req.message,
+                    screenshot_b64=req.screenshot_base64,
+                    screenshot_mime=req.screenshot_mime,
+                )
+                conversation_id = None
+            else:
+                # Authenticated — persist per-user history, return the conversation id.
+                answer, raw_citations, grounded, refused, conversation_id = (
+                    service.chat_authenticated(
+                        user=user,
+                        session_id=req.session_id,
+                        message=req.message,
+                        conversation_id=req.conversation_id,
+                        screenshot_b64=req.screenshot_base64,
+                        screenshot_mime=req.screenshot_mime,
+                        background=background,
+                    )
+                )
             citations = [CitationItem(**c) for c in raw_citations] if raw_citations else []
             return ChatResponse(
                 answer=answer,
                 session_id=req.session_id,
+                conversation_id=conversation_id,
                 citations=citations,
                 grounded=grounded,
                 refused=refused,
             )
+        except ConversationNotFoundError:
+            raise HTTPException(status_code=404, detail="Conversation not found.")
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         except Exception as exc:
@@ -103,7 +144,11 @@ def build_router(service: ChatService) -> APIRouter:
             raise HTTPException(status_code=500, detail="An internal error occurred. Please try again.")
 
     @router.post("/chat/stream", dependencies=[Depends(_require_api_key)])
-    def chat_stream(req: ChatRequest):
+    def chat_stream(
+        req: ChatRequest,
+        background: BackgroundTasks,
+        user: Optional[NormalizedUser] = Depends(get_optional_user),
+    ):
         """Server-Sent Events streaming (P1-6).
 
         Emits incremental ``token`` events for UX, then a single authoritative
@@ -114,10 +159,54 @@ def build_router(service: ChatService) -> APIRouter:
             generator = service.chat_stream(
                 session_id=req.session_id,
                 message=req.message,
+                user=user,
+                conversation_id=req.conversation_id,
+                background=background,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
         return StreamingResponse(generator, media_type="text/event-stream")
+
+    @router.get("/conversations", response_model=List[ConversationOut])
+    def list_conversations(user: NormalizedUser = Depends(get_current_user)):
+        """History sidebar — the current user's conversations, most recent first."""
+        convs = service.list_conversations(user.id)
+        return [
+            ConversationOut(
+                id=c.id, title=c.title, created_at=c.created_at, updated_at=c.updated_at
+            )
+            for c in convs
+        ]
+
+    @router.get(
+        "/conversations/{conversation_id}/messages",
+        response_model=ConversationDetail,
+    )
+    def get_conversation_messages(
+        conversation_id: str, user: NormalizedUser = Depends(get_current_user)
+    ):
+        """Load a past conversation into the chat window (ownership-checked)."""
+        result = service.get_conversation_with_messages(user.id, conversation_id)
+        if result is None:
+            # 404 (not 403) so the API cannot be used to probe for others' ids.
+            raise HTTPException(status_code=404, detail="Conversation not found.")
+        conv, messages = result
+        return ConversationDetail(
+            id=conv.id,
+            title=conv.title,
+            messages=[
+                MessageOut(role=m.role, content=m.content, created_at=m.created_at)
+                for m in messages
+            ],
+        )
+
+    @router.delete("/conversations/{conversation_id}")
+    def delete_conversation(
+        conversation_id: str, user: NormalizedUser = Depends(get_current_user)
+    ):
+        if not service.delete_conversation(user.id, conversation_id):
+            raise HTTPException(status_code=404, detail="Conversation not found.")
+        return {"deleted": conversation_id}
 
     @router.delete("/chat/{session_id}")
     def clear_session(session_id: str):

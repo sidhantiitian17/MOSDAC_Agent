@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from typing import List
 
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -19,6 +20,7 @@ class ChatAPISettings(BaseSettings):
         env_prefix="CHAT_API_",
         extra="ignore",
         case_sensitive=False,
+        populate_by_name=True,
     )
 
     # Branding
@@ -97,12 +99,70 @@ class ChatAPISettings(BaseSettings):
     # the endpoint entirely. Keep distinct from api_key (operator vs caller).
     admin_token: str = ""
 
+    # ── SSO JWT field mapping (adapter pattern) ──────────────────────────────
+    # Claim KEYS are NEVER hardcoded in the codebase: normalize_user_data() reads
+    # the user id / username / email out of a decoded Keycloak token using these
+    # names. A government portal that issues custom claims only edits .env.
+    # Both the bare names (JWT_FIELD_ID) and the prefixed form
+    # (CHAT_API_JWT_FIELD_ID) are accepted so the documented SSO block works as-is.
+    jwt_field_id: str = Field(
+        default="sub",
+        validation_alias=AliasChoices("CHAT_API_JWT_FIELD_ID", "JWT_FIELD_ID"),
+    )
+    jwt_field_username: str = Field(
+        default="preferred_username",
+        validation_alias=AliasChoices("CHAT_API_JWT_FIELD_USERNAME", "JWT_FIELD_USERNAME"),
+    )
+    jwt_field_email: str = Field(
+        default="email",
+        validation_alias=AliasChoices("CHAT_API_JWT_FIELD_EMAIL", "JWT_FIELD_EMAIL"),
+    )
+
+    # ── Keycloak / OIDC (per-user auth via JWKS) ─────────────────────────────
+    # Master switch. When false (default) the API behaves exactly as before:
+    # /chat is anonymous/ephemeral and the /conversations endpoints 503. Turn on
+    # only once an issuer/JWKS source is configured.
+    auth_enabled: bool = False
+    # Realm issuer, e.g. https://keycloak.example.org/realms/mosdac . The JWKS
+    # URL is derived from it unless keycloak_jwks_url is set explicitly.
+    keycloak_issuer: str = ""
+    keycloak_jwks_url: str = ""
+    # Audience(s) the access token must carry (comma-separated). Empty disables
+    # the aud check (some Keycloak setups don't pin an audience on access tokens).
+    keycloak_audience: str = ""
+    # Allowed signing algorithms (comma-separated). RS256 only by default — an
+    # explicit allow-list blocks the `alg:none` and HS/RS confusion attacks.
+    jwt_algorithms: str = "RS256"
+    # How long signing keys are cached before the JWKS endpoint is re-fetched.
+    jwks_cache_seconds: int = 3600
+
+    # ── Conversation store (per-user chat history) ───────────────────────────
+    # "sqlite" persists conversations/messages for authenticated users so each
+    # user gets their own history sidebar. "none" disables persistence entirely
+    # (every request behaves like an anonymous, ephemeral session).
+    conv_store: str = "sqlite"            # "sqlite" | "none"
+    sqlite_path: str = "./conversations.db"
+
     # Networking
     host: str = "0.0.0.0"
     port: int = 8000
 
     def origins_list(self) -> List[str]:
         return [o.strip() for o in self.allowed_origins.split(",") if o.strip()]
+
+    def jwt_algorithms_list(self) -> List[str]:
+        return [a.strip() for a in self.jwt_algorithms.split(",") if a.strip()]
+
+    def keycloak_audiences_list(self) -> List[str]:
+        return [a.strip() for a in self.keycloak_audience.split(",") if a.strip()]
+
+    def effective_jwks_url(self) -> str:
+        """Explicit JWKS URL, else derive the standard one from the issuer."""
+        if self.keycloak_jwks_url:
+            return self.keycloak_jwks_url
+        if self.keycloak_issuer:
+            return f"{self.keycloak_issuer.rstrip('/')}/protocol/openid-connect/certs"
+        return ""
 
     def methods_list(self) -> List[str]:
         return [m.strip() for m in self.allowed_methods.split(",") if m.strip()]

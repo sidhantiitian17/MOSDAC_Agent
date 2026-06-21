@@ -544,3 +544,156 @@ def test_get_llm_is_zero_arg_singleton():
     assert len(sig.parameters) == 0, (
         f"get_llm should have 0 parameters, got: {list(sig.parameters)}"
     )
+
+
+# ── Per-user history: auth + conversation persistence (SSO) ──────────────────
+
+class _StubTitler:
+    """Avoids a real LLM call (and its 60s timeout) in background titling."""
+
+    def make_title(self, question, answer=""):
+        return "Test Title"
+
+
+@pytest.fixture
+def authed_client():
+    """A client where the auth dependencies are overridden to a fixed user and the
+    service is backed by an in-memory SQLite conversation store."""
+    from chat_api.auth import NormalizedUser, get_current_user, get_optional_user
+    from chat_api.db.sqlite_repo import SQLiteConversationRepository
+    from chat_api.main import create_app
+    from chat_api.service import ChatService
+    from chat_api.session import InMemorySessionStore
+
+    retriever = MagicMock()
+    retriever.retrieve.return_value = {
+        "graph_context": "g",
+        "vector_context": "[Source: test.pdf | score=0.9000]\nMOSDAC passage.",
+        "_hits": [VectorHit(text="MOSDAC passage.", source="test.pdf", score=0.9, chunk_id="c1")],
+    }
+    chain = MagicMock()
+    chain.invoke.return_value = "mock-answer"
+    repo = SQLiteConversationRepository(":memory:")
+    service = ChatService(
+        retriever=retriever, chain=chain, llm=MagicMock(),
+        sessions=InMemorySessionStore(), repo=repo,
+    )
+    service._titler = _StubTitler()  # no network during background titling
+
+    app = create_app(service=service)
+    user_a = NormalizedUser(id="userA", username="alice", email="a@x")
+    app.dependency_overrides[get_current_user] = lambda: user_a
+    app.dependency_overrides[get_optional_user] = lambda: user_a
+
+    client = TestClient(app)
+    try:
+        yield client, repo, app
+    finally:
+        repo.close()
+
+
+def test_anonymous_chat_returns_null_conversation_id(test_client):
+    """With no authenticated user, /chat behaves as before (ephemeral, no DB)."""
+    client, _sessions = test_client
+    r = client.post("/chat", json={"session_id": _SID1, "message": "hi there"})
+    assert r.status_code == 200
+    assert r.json()["conversation_id"] is None
+
+
+def test_authed_chat_creates_and_persists_conversation(authed_client):
+    client, repo, _app = authed_client
+    r = client.post("/chat", json={"session_id": _SID1, "message": "hi there"})
+    assert r.status_code == 200
+    cid = r.json()["conversation_id"]
+    assert cid  # a conversation id was returned
+    msgs = repo.list_messages("userA", cid)
+    assert [(m.role, m.content) for m in msgs] == [
+        ("user", "hi there"),
+        ("assistant", "mock-answer"),
+    ]
+
+
+def test_authed_chat_continues_existing_conversation(authed_client):
+    client, repo, _app = authed_client
+    cid = client.post("/chat", json={"session_id": _SID1, "message": "first q"}).json()[
+        "conversation_id"
+    ]
+    r2 = client.post(
+        "/chat",
+        json={"session_id": _SID1, "message": "second q", "conversation_id": cid},
+    )
+    assert r2.json()["conversation_id"] == cid
+    assert len(repo.list_messages("userA", cid)) == 4
+
+
+def test_list_conversations_endpoint(authed_client):
+    client, _repo, _app = authed_client
+    client.post("/chat", json={"session_id": _SID1, "message": "hello"})
+    r = client.get("/conversations")
+    assert r.status_code == 200
+    items = r.json()
+    assert len(items) == 1
+    assert items[0]["id"] and "title" in items[0]
+
+
+def test_get_conversation_messages_endpoint(authed_client):
+    client, _repo, _app = authed_client
+    cid = client.post("/chat", json={"session_id": _SID1, "message": "hello"}).json()[
+        "conversation_id"
+    ]
+    r = client.get(f"/conversations/{cid}/messages")
+    assert r.status_code == 200
+    detail = r.json()
+    assert detail["id"] == cid
+    assert [m["role"] for m in detail["messages"]] == ["user", "assistant"]
+
+
+def test_delete_conversation_endpoint(authed_client):
+    client, repo, _app = authed_client
+    cid = client.post("/chat", json={"session_id": _SID1, "message": "hello"}).json()[
+        "conversation_id"
+    ]
+    r = client.delete(f"/conversations/{cid}")
+    assert r.status_code == 200
+    assert repo.get_conversation("userA", cid) is None
+
+
+def test_idor_other_user_cannot_load_or_delete(authed_client):
+    """A second user must get 404 (not 403) for another user's conversation."""
+    from chat_api.auth import NormalizedUser, get_current_user
+
+    client, _repo, app = authed_client
+    cid = client.post("/chat", json={"session_id": _SID1, "message": "secret"}).json()[
+        "conversation_id"
+    ]
+    app.dependency_overrides[get_current_user] = lambda: NormalizedUser(
+        id="userB", username="bob", email="b@x"
+    )
+    assert client.get(f"/conversations/{cid}/messages").status_code == 404
+    assert client.delete(f"/conversations/{cid}").status_code == 404
+
+
+def test_idor_cannot_continue_another_users_conversation(authed_client):
+    from chat_api.auth import NormalizedUser, get_optional_user
+
+    client, _repo, app = authed_client
+    cid = client.post("/chat", json={"session_id": _SID1, "message": "mine"}).json()[
+        "conversation_id"
+    ]
+    app.dependency_overrides[get_optional_user] = lambda: NormalizedUser(
+        id="userB", username="bob", email="b@x"
+    )
+    r = client.post(
+        "/chat",
+        json={"session_id": _SID2, "message": "steal", "conversation_id": cid},
+    )
+    assert r.status_code == 404
+
+
+def test_invalid_conversation_id_returns_422(authed_client):
+    client, _repo, _app = authed_client
+    r = client.post(
+        "/chat",
+        json={"session_id": _SID1, "message": "hello", "conversation_id": "not-a-uuid"},
+    )
+    assert r.status_code == 422

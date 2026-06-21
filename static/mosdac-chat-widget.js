@@ -1,25 +1,33 @@
 // static/mosdac-chat-widget.js
-// MOSDAC-specific shim — sets MOSDAC branding then loads the generic widget.
-// Kept for backward compatibility with existing NGINX sub_filter rules and
-// portal <script> tags. For any new portal, point directly at
-// /static/graph-rag-chat-widget.js with your own GRAPH_RAG_CHAT_CONFIG.
+// MOSDAC-branded shim — sets ISRO/MOSDAC BOT defaults, then loads the generic widget.
+// Kept for backward compatibility with existing NGINX sub_filter rules and portal
+// <script> tags. For a new portal, point directly at /static/graph-rag-chat-widget.js
+// with your own GRAPH_RAG_CHAT_CONFIG. Anything set on the page before this script
+// loads overrides these defaults (page config wins), so re-branding is config-only.
 
 (function () {
   'use strict';
 
   window.GRAPH_RAG_CHAT_CONFIG = Object.assign({
     apiBase:       '/chatapi',
-    title:         'MOSDAC Assistant',
-    botLogo:       '/favicon.ico',
-    greeting:      'Hello! I am the MOSDAC Assistant. Ask me anything about satellite data, products, cyclones, ocean state, or click the camera icon to attach a screenshot of what you see.',
-    accent:        '#1565c0',
-    accentHover:   '#0d47a1',
-    panelBg:       '#1a1a2e',
-    headerBg:      '#0d1b4b',
+    botTitle:      'MOSDAC BOT',
+    // ISRO logo — override per deployment with whatever the site serves.
+    logoUrl:       '/static/isro-logo.png',
+    greeting:      "Hey User, what's on your mind today?",
+    suggestions:   ['How can you help me browse?', 'What can you do?', 'Explain a topic'],
     elementPrefix: 'mosdac',
+    // Default SSO token source: a token injected server-side by Drupal/OIDC into a
+    // JS variable or <meta name="kc-token">. No token → anonymous, ephemeral chat.
+    getToken: function () {
+      try {
+        if (window.KC_TOKEN) return window.KC_TOKEN;
+        var m = document.querySelector('meta[name="kc-token"]');
+        return (m && m.content) || '';
+      } catch (e) { return ''; }
+    },
   }, window.GRAPH_RAG_CHAT_CONFIG || {});
 
-  // Resolve the script path so we can load the generic widget from the same folder.
+  // Load the generic widget from the same folder this shim was served from.
   const here = document.currentScript ? document.currentScript.src : '';
   const baseURL = here.replace(/mosdac-chat-widget\.js.*$/, '');
   const tag = document.createElement('script');

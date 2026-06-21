@@ -29,6 +29,11 @@ chroma_test_tmp*/
 ingest_manifest.json
 drupal_ingestion_state.json
 
+# Conversation store (per-user chat history — runtime DB, never commit)
+conversations.db
+conversations.db-wal
+conversations.db-shm
+
 # Generated eval output
 eval_results.md
 

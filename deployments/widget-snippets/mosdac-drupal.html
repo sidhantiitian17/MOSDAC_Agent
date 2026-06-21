@@ -1,0 +1,31 @@
+<!-- ==========================================================================
+     MOSDAC BOT — embed snippet for a Drupal site.
+     Place before </body> in the Drupal theme (e.g. html.html.twig).
+
+     SSO: a logged-in user's Keycloak access token is exposed to the page by the
+     Drupal OIDC module (server-side) via the <meta> tag below. Anonymous pages
+     simply omit the meta tag — the widget then runs an ephemeral chat with no
+     history sidebar. Nothing here is hardcoded in the backend.
+     ========================================================================== -->
+
+<!-- Rendered server-side ONLY for authenticated users (empty/absent otherwise) -->
+<meta name="kc-token" content="{{ keycloak_access_token }}">
+
+<script>
+  window.GRAPH_RAG_CHAT_CONFIG = {
+    apiBase:  '/chatapi',                          // nginx → FastAPI (change per site)
+    botTitle: 'MOSDAC BOT',
+    logoUrl:  '/static/isro-logo.png',             // ISRO logo
+    greeting: "Hey User, what's on your mind today?",
+    suggestions: ['How can you help me browse?', 'What can you do?', 'Explain a topic'],
+    elementPrefix: 'mosdac',
+    // getToken is provided by the shim below (reads window.KC_TOKEN / meta tag);
+    // override here only if your portal exposes the token differently.
+  };
+</script>
+
+<!-- Optional: enables "attach a screenshot". Remove if not needed. -->
+<script src="/static/html2canvas.min.js"></script>
+
+<!-- Branded shim → loads the generic widget from the same folder. -->
+<script src="/static/mosdac-chat-widget.js"></script>

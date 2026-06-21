@@ -43,6 +43,13 @@ spacy>=3.7
 fastapi>=0.100
 uvicorn[standard]>=0.23
 
+# SSO / Keycloak — JWT verification against the realm's JWKS public keys.
+# The [crypto] extra brings the RS256 signing-key support PyJWKClient needs.
+# Only loaded when CHAT_API_AUTH_ENABLED=true (imported lazily in chat_api/auth.py).
+PyJWT[crypto]>=2.8
+# Per-user conversation history is stored in SQLite via the stdlib `sqlite3`
+# module — no extra dependency required.
+
 # Hybrid search — BM25 keyword ranking (Reciprocal Rank Fusion with vector search)
 rank-bm25>=0.2.2
 
