@@ -6,7 +6,22 @@ runs cleanly in environments where only some pieces are wired up.
 """
 from __future__ import annotations
 
+import os
 import tempfile
+
+from dotenv import dotenv_values
+
+# Importing ``chat_api`` composes a default app at module load
+# (chat_api/main.py: ``app = create_app()``), which constructs the Tabby LLM
+# client and requires TABBY_API_TOKEN. CI runs with no .env, so the import would
+# crash. Supply a dummy token ONLY when neither the environment nor a local .env
+# provides one — so the suite imports and unit-tests the app with NO live LLM.
+# ``dotenv_values()`` reads .env into a dict WITHOUT mutating os.environ, so we
+# never leak real .env values into the process (that would defeat tests that
+# construct settings with ``_env_file=None`` to assert code-level defaults).
+# Tests that need a live Tabby/Neo4j/embedder still skip when it's unreachable.
+if not os.environ.get("TABBY_API_TOKEN") and not dotenv_values().get("TABBY_API_TOKEN"):
+    os.environ["TABBY_API_TOKEN"] = "test-token"
 
 import pytest
 
