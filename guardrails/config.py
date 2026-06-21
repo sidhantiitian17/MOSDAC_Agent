@@ -38,14 +38,32 @@ class GuardrailSettings(BaseSettings):
     scope_min_sim: float = 0.35
     max_input_length: int = 2000
 
+    # When the embedder is down, the scope gate and the injection embedding tier
+    # cannot run. By default they fail OPEN (availability) but the degradation is
+    # now ALWAYS observable (metric + WARN). Set EMBEDDER_REQUIRED=true to instead
+    # fail CLOSED — refuse while the embedder is unavailable (strict prod posture).
+    embedder_required: bool = False
+
     # L2 Retrieval
     retrieval_min_score: float = 0.20
     min_supporting_passages: int = 1
     source_allowlist: bool = True
+    # Scan retrieved passages for injection directives (indirect injection, P1-3)
+    # and neutralize them before they reach the prompt. Hits are kept intact for
+    # grounding/citation; only the LLM-facing context copy is sanitized.
+    context_injection_scan: bool = True
 
     # L4 Output
     citation_verify: bool = True
     grounding_min_sim: float = 0.40
+    # What to do with ungrounded numbers/sentences detected at output time:
+    #   "flag"   — log only (legacy behaviour; hallucinations still reach the user)
+    #   "strip"  — remove ungrounded sentences; refuse if too little survives
+    #   "refuse" — any ungrounded content → canonical "no info" refusal
+    grounding_action: str = "strip"
+    # In "strip" mode, refuse instead if more than this fraction of factual
+    # sentences are ungrounded (the answer is mostly unsupported).
+    grounding_max_ungrounded_ratio: float = 0.5
     toxicity: bool = True
     leakage_check: bool = True
 
@@ -54,10 +72,20 @@ class GuardrailSettings(BaseSettings):
     rate_limit_per_min: int = 20
     session_ttl_seconds: int = 86400
     abuse_lockout_threshold: int = 10
+    # Durable audit sink: when set, every PII-safe audit record is ALSO appended to
+    # this file via a size-rotating handler (queryable, survives restarts). Empty =
+    # stdout logger only. Never contains raw user text (see audit/logger.py).
+    audit_log_path: str = ""
+    audit_log_max_bytes: int = 50 * 1024 * 1024
+    audit_log_backups: int = 5
 
     # Paths
     scope_centroid_path: str = "./guardrails_data/scope_centroid.npy"
     injection_corpus_path: str = "./tests/guardrails/injection_corpus.txt"
+    # Optional: domain scope seed phrases, one per line (# comments allowed). When
+    # set and present, REPLACES the built-in MOSDAC seeds so the same image serves
+    # a different domain without a code change (P2-1). Empty → built-in seeds.
+    scope_seed_path: str = ""
 
 
 guardrail_settings = GuardrailSettings()

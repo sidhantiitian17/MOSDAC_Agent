@@ -19,11 +19,71 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import threading
 import time
 import uuid
+from pathlib import Path
 from typing import List
 
 audit_logger = logging.getLogger("guardrails.audit")
+
+# ── Durable file sink (attached once, lazily) ─────────────────────────────────
+_sink_lock = threading.Lock()
+_sink_attached = False
+
+# Cached hash of the active system prompt (recomputed when the file changes), so
+# each audit record can be tied to the exact prompt that produced the answer.
+_prompt_hash_cache: tuple[float, str] | None = None
+
+
+def _ensure_file_sink() -> None:
+    """Attach a size-rotating file handler to the audit logger when configured."""
+    global _sink_attached
+    if _sink_attached:
+        return
+    with _sink_lock:
+        if _sink_attached:
+            return
+        try:
+            from guardrails.config import guardrail_settings as cfg
+
+            path = (cfg.audit_log_path or "").strip()
+            if path:
+                from logging.handlers import RotatingFileHandler
+
+                Path(path).parent.mkdir(parents=True, exist_ok=True)
+                handler = RotatingFileHandler(
+                    path,
+                    maxBytes=cfg.audit_log_max_bytes,
+                    backupCount=cfg.audit_log_backups,
+                    encoding="utf-8",
+                )
+                handler.setFormatter(logging.Formatter("%(message)s"))
+                audit_logger.addHandler(handler)
+                audit_logger.setLevel(logging.INFO)
+                audit_logger.info(json.dumps({"event": "audit_sink_attached", "path": path}))
+        except Exception:  # never let logging setup break a request
+            pass
+        _sink_attached = True
+
+
+def _system_prompt_hash() -> str:
+    """Short hash of the active system prompt file (cached on mtime)."""
+    global _prompt_hash_cache
+    try:
+        from graph_rag.config import settings
+
+        p = Path(settings.system_prompt_path)
+        if not p.exists():
+            return "default"
+        mtime = p.stat().st_mtime
+        if _prompt_hash_cache and _prompt_hash_cache[0] == mtime:
+            return _prompt_hash_cache[1]
+        digest = hashlib.sha256(p.read_bytes()).hexdigest()[:12]
+        _prompt_hash_cache = (mtime, digest)
+        return digest
+    except Exception:
+        return "unknown"
 
 
 def _hash_session(session_id: str) -> str:
@@ -42,6 +102,7 @@ def log_request(
     has_citations: bool = False,
 ) -> str:
     """Write one audit record; returns the request_id for response correlation."""
+    _ensure_file_sink()
     request_id = str(uuid.uuid4())
     record = {
         "request_id": request_id,
@@ -54,6 +115,7 @@ def log_request(
         "top_score": round(top_score, 4),
         "latency_ms": round(latency_ms, 1),
         "has_citations": has_citations,
+        "system_prompt_hash": _system_prompt_hash(),
     }
     audit_logger.info(json.dumps(record))
     return request_id

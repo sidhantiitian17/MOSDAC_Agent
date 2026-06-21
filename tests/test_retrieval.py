@@ -10,7 +10,7 @@ def test_vector_retriever_formats_context():
     from graph_rag.retrieval.vector_retriever import VectorRetriever
 
     mock_store = MagicMock()
-    mock_store.similarity_search_with_score.return_value = [
+    mock_store.similarity_search_with_relevance.return_value = [
         (Document(page_content="Apple bought Beats.", metadata={"source": "a.pdf", "chunk_id": "c1"}), 0.1),
         (Document(page_content="Microsoft bought GitHub.", metadata={"source": "b.pdf", "chunk_id": "c2"}), 0.2),
     ]
@@ -28,7 +28,7 @@ def test_vector_retriever_handles_empty_results():
     from graph_rag.retrieval.vector_retriever import VectorRetriever
 
     mock_store = MagicMock()
-    mock_store.similarity_search_with_score.return_value = []
+    mock_store.similarity_search_with_relevance.return_value = []
     r = VectorRetriever.__new__(VectorRetriever)
     r._store = mock_store
     r._k = 5

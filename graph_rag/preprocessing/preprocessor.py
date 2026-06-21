@@ -29,8 +29,8 @@ from langchain_text_splitters import MarkdownHeaderTextSplitter
 
 logger = logging.getLogger(__name__)
 
-PDF_SUFFIXES = {".pdf"}
-HTML_SUFFIXES = {".html", ".htm", ".xhtml"}
+# File-format routing lives in the single-source-of-truth registry
+# (graph_rag/ingestion/formats.py) — no suffix sets are duplicated here.
 
 # Tags that carry no document content — chrome, scripts, layout. Removed wholesale.
 _JUNK_TAGS = (
@@ -51,6 +51,8 @@ _JUNK_ATTR_SIGNATURES = (
 
 def _is_junk_container(tag) -> bool:
     """True if a tag's class/id looks like web chrome (cookie bar, popup, etc.)."""
+    if not tag.attrs:
+        return False
     attrs = " ".join(tag.get("class", []) + [tag.get("id", "")]).lower()
     return any(sig in attrs for sig in _JUNK_ATTR_SIGNATURES)
 
@@ -101,33 +103,46 @@ def _clean_html_to_tempfile(path: Path) -> Path:
 
 # ── Step 2: Core parsing (Docling) ──────────────────────────────────────────
 
-@lru_cache(maxsize=2)
+@lru_cache(maxsize=1)
 def _build_converter():
-    """Build & cache a Docling DocumentConverter (model load is expensive).
+    """Build & cache the one unified Docling DocumentConverter (model load is expensive).
 
-    Configuration mirrors graph_rag/ingestion/docling_parser.py so both paths
-    produce identical Markdown for the same input:
+    A single converter serves every Docling-parsed format — PDF, HTML, DOCX,
+    XLSX, PPTX, CSV, AsciiDoc and images — so they all go through identical
+    options. The set of allowed formats is derived from the format registry
+    (graph_rag/ingestion/formats.py): adding a new format there flows into this
+    converter automatically, with no edit here.
+
+    PDF/IMAGE options (OCR + tables + formula, VLM OFF) mirror
+    graph_rag/ingestion/docling_parser.py so both paths produce identical
+    Markdown. Office/CSV/AsciiDoc need no per-format options — Docling defaults
+    already emit structured Markdown.
       do_ocr                = True  → Tesseract reads burned-in labels on heatmaps
       do_table_structure    = True  → TableFormer produces real Markdown tables
       do_formula_enrichment = True  → CodeFormula wraps equations as $$...$$ LaTeX
       VLM picture pipeline  = OFF   → OCR text inside images only, no captioning
-    TesseractCliOcrOptions matches the system tesseract binary installed in
-    Dockerfile.api — more robust than the Python pytesseract binding under load.
     """
     from docling.datamodel.base_models import InputFormat
     from docling.datamodel.pipeline_options import (
         PdfPipelineOptions,
         TesseractCliOcrOptions,
     )
-    from docling.document_converter import DocumentConverter, PdfFormatOption
+    from docling.document_converter import (
+        DocumentConverter,
+        ImageFormatOption,
+        PdfFormatOption,
+    )
 
-    ocr_options = TesseractCliOcrOptions(lang=["eng"])
+    from graph_rag.config import settings
+    from graph_rag.ingestion import formats
+
+    ocr_options = TesseractCliOcrOptions(lang=[settings.docling_ocr_lang])
 
     pdf_opts = PdfPipelineOptions()
     pdf_opts.do_ocr = True
     pdf_opts.ocr_options = ocr_options
-    pdf_opts.do_table_structure = True
-    pdf_opts.do_formula_enrichment = True
+    pdf_opts.do_table_structure = settings.docling_do_table_structure
+    pdf_opts.do_formula_enrichment = settings.docling_do_formula_enrichment
     pdf_opts.table_structure_options.do_cell_matching = True
     # Never enable VLM picture description — it would make model-load non-deterministic
     # and burn GPU memory needed for the 32B extraction model.
@@ -135,12 +150,47 @@ def _build_converter():
     pdf_opts.do_picture_classification = False
     pdf_opts.generate_picture_images = False
 
-    return DocumentConverter(
-        # Registering HTML here lets the same converter handle cleaned temp files
-        # without a separate converter instance.
-        allowed_formats=[InputFormat.PDF, InputFormat.HTML],
-        format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=pdf_opts)},
-    )
+    # Resolve enabled InputFormat names from the registry → enum members. An
+    # unknown name (older Docling without that format) is skipped gracefully.
+    allowed = []
+    for name in formats.docling_input_format_names():
+        member = getattr(InputFormat, name, None)
+        if member is not None:
+            allowed.append(member)
+
+    format_options = {}
+    if InputFormat.PDF in allowed:
+        format_options[InputFormat.PDF] = PdfFormatOption(pipeline_options=pdf_opts)
+    # Image pipeline reuses the OCR options so scanned figures/screenshots yield text.
+    if InputFormat.IMAGE in allowed:
+        format_options[InputFormat.IMAGE] = ImageFormatOption(pipeline_options=pdf_opts)
+
+    return DocumentConverter(allowed_formats=allowed, format_options=format_options)
+
+
+def _normalize_gif_to_png(path: Path) -> Path:
+    """Flatten the first frame of a GIF to a temp PNG for the Docling IMAGE pipeline.
+
+    Docling's image pipeline targets still raster formats — an (especially
+    animated) GIF is not a first-class InputFormat. We OCR the first frame only;
+    animation is dropped by design (documented in alldoc.md §3).
+    """
+    import os
+
+    from PIL import Image
+
+    tmp_fd, tmp_path = tempfile.mkstemp(suffix=".png", prefix="mosdac_gif_")
+    tmp = Path(tmp_path)
+    os.close(tmp_fd)
+    try:
+        with Image.open(path) as im:
+            im.seek(0)  # first frame
+            im.convert("RGB").save(tmp, "PNG")
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+    logger.info("GIF normalize: %s → %s (first frame)", path.name, tmp.name)
+    return tmp
 
 
 def _parse_to_markdown(path: Path) -> str:
@@ -244,17 +294,92 @@ def clean_markdown(markdown: str) -> str:
 # so deeply nested subsections don't become tiny orphan chunks.
 _HEADERS_TO_SPLIT_ON = [("#", "h1"), ("##", "h2"), ("###", "h3")]
 
+# A contiguous run of Markdown table rows (lines that start/end with `|`). Treated
+# as one atomic block so a size-based sub-split never severs a table mid-row.
+_TABLE_BLOCK = re.compile(r"(?:^[ \t]*\|.*\|[ \t]*$\n?)+", re.MULTILINE)
+_TABLE_PLACEHOLDER = "\x00TABLE{}\x00"
+# Leading Markdown heading lines of a section — re-prepended to every sub-chunk
+# so each piece keeps its section title as context after a size split.
+_HEADING_LINES = re.compile(r"\A(?:\s*#{1,6}[^\n]*\n)+")
+
+
+def _protect_blocks(text: str) -> tuple[str, list[str], list[str]]:
+    """Hide math AND table blocks behind NUL placeholders before a size split."""
+    text, math_stash = _protect_math(text)
+    table_stash: list[str] = []
+
+    def _swap(m: re.Match) -> str:
+        table_stash.append(m.group(0))
+        return _TABLE_PLACEHOLDER.format(len(table_stash) - 1)
+
+    text = _TABLE_BLOCK.sub(_swap, text)
+    return text, math_stash, table_stash
+
+
+def _restore_blocks(text: str, math_stash: list[str], table_stash: list[str]) -> str:
+    for i, tbl in enumerate(table_stash):
+        text = text.replace(_TABLE_PLACEHOLDER.format(i), tbl)
+    return _restore_math(text, math_stash)
+
+
+def _subsplit_section(doc: Document, max_chars: int, overlap: int) -> list[Document]:
+    """Sub-split an over-long section on paragraph/sentence boundaries, math/table-safe.
+
+    Sections within ``max_chars`` are returned untouched (the common case). Larger
+    sections are split so each piece fits the embedder's context window — without
+    this, a 2–4 k-token section is embedded from only its first ~512 tokens and
+    everything below is invisible to vector search. Every piece keeps the section
+    heading prefix, and no ``$$…$$`` block or table row is ever cut.
+    """
+    content = doc.page_content
+    if len(content) <= max_chars:
+        return [doc]
+
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+    m = _HEADING_LINES.match(content)
+    heading = m.group(0) if m else ""
+
+    protected, math_stash, table_stash = _protect_blocks(content)
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=max_chars,
+        chunk_overlap=overlap,
+        separators=["\n\n", "\n", ". ", " ", ""],
+    )
+    pieces = [
+        _restore_blocks(p, math_stash, table_stash) for p in splitter.split_text(protected)
+    ]
+    pieces = [p.strip() for p in pieces if p.strip()]
+    if len(pieces) <= 1:
+        return [doc]
+
+    # Stable shared parent id so optional parent-section expansion can re-group
+    # the children at retrieval time (graph_rag/retrieval/hybrid_retriever.py).
+    import hashlib
+
+    parent_id = hashlib.sha1(content[:512].encode("utf-8")).hexdigest()[:16]
+    out: list[Document] = []
+    for i, piece in enumerate(pieces):
+        body = piece if (not heading or piece.startswith(heading.strip())) else f"{heading}{piece}"
+        meta = dict(doc.metadata)
+        meta["parent_id"] = parent_id
+        meta["section_part"] = i
+        out.append(Document(page_content=body, metadata=meta))
+    return out
+
 
 def chunk_markdown(markdown: str) -> list[Document]:
-    """Split cleaned Markdown on section headers; sections stay whole.
+    """Split cleaned Markdown on section headers, then cap over-long sections.
 
-    strip_headers=False keeps the heading in the chunk body so the 32B model sees
-    the section title as context when it reasons over the passage.
+    strip_headers=False keeps the heading in the chunk body so the model sees the
+    section title as context when it reasons over the passage.
 
-    We deliberately do NOT chain a character-level splitter. The 32B model can
-    handle a full scientific section (~2-4 k tokens), and any size-based cut
-    risks severing a $$...$$ block or a table mid-row. If a single section is
-    pathologically large it is still better to pass it whole than to corrupt it.
+    Sections are first split on ``#/##/###`` headers (never mid-structure). A
+    section that still exceeds ``settings.chunk_max_section_chars`` is then
+    sub-split on paragraph/sentence boundaries by ``_subsplit_section`` — math and
+    table blocks stay atomic — so long sections remain fully searchable instead of
+    being silently truncated by the embedder. Set ``enable_section_subsplit=False``
+    to restore the previous whole-section behaviour.
 
     Public so loader.py can use it for PDF post-processing independently of the
     HTML preprocessing path.
@@ -267,8 +392,18 @@ def chunk_markdown(markdown: str) -> list[Document]:
     # Header-less documents (e.g. raw data tables, plain text PDFs) yield zero
     # splits — keep as one chunk rather than dropping the document entirely.
     if not docs and markdown.strip():
-        return [Document(page_content=markdown)]
-    return [d for d in docs if d.page_content.strip()]
+        docs = [Document(page_content=markdown)]
+    docs = [d for d in docs if d.page_content.strip()]
+
+    from graph_rag.config import settings as _s
+
+    if not _s.enable_section_subsplit:
+        return docs
+
+    out: list[Document] = []
+    for d in docs:
+        out.extend(_subsplit_section(d, _s.chunk_max_section_chars, _s.chunk_overlap))
+    return out
 
 
 # ── Step 5: Dynamic metadata enrichment ─────────────────────────────────────
@@ -284,10 +419,22 @@ def enrich_chunks(
     knows to skip re-splitting — these chunks are already header-split.
 
     Public so loader.py can call it independently for the PDF post-processing path.
+
+    Per-type metadata defaults (e.g. ``domain_type``) and the page-number policy
+    come from the format registry keyed on ``source_type`` — no hard-coded
+    ``if source_type == "pdf"`` branch, so a new format gets correct metadata by
+    adding a registry row only.
     """
+    from graph_rag.ingestion import formats
+    from graph_rag.text_features import has_formula, has_table, numeric_density
+
+    defaults = formats.metadata_defaults_for(source_type)
+    keep_page_number = formats.preserves_page_number(source_type)
+
     enriched: list[Document] = []
     for idx, chunk in enumerate(chunks):
         meta = dict(chunk.metadata)      # copy — never mutate the splitter's dict
+        body = chunk.page_content
         meta.update(
             {
                 "source": str(path),
@@ -297,16 +444,22 @@ def enrich_chunks(
                 "content_type": "markdown",
                 # Signal to splitter.py: these are already correctly split.
                 "pre_chunked": True,
+                # Structure features — let retrieval bias toward formula/table/
+                # quantitative chunks for the matching query type (text_features.py).
+                "has_formula": has_formula(body),
+                "has_table": has_table(body),
+                "numeric_density": numeric_density(body),
             }
         )
-        if source_type == "pdf":
+        # Apply per-type defaults without clobbering anything the splitter set.
+        for key, value in defaults.items():
+            meta.setdefault(key, value)
+        if keep_page_number:
             # Docling's markdown export does not surface a reliable per-chunk page
             # number after heading-based splitting. Preserve any value the splitter
             # already extracted; default to None so downstream code can branch on
             # its presence.
             meta.setdefault("page_number", chunk.metadata.get("page_number"))
-        else:
-            meta["domain_type"] = "web_scrape"
         enriched.append(Document(page_content=chunk.page_content, metadata=meta))
     return enriched
 
@@ -314,43 +467,73 @@ def enrich_chunks(
 # ── Public entry point ──────────────────────────────────────────────────────
 
 def preprocess_file(path: str | Path) -> list[Document]:
-    """Run the full 5-step pipeline on one PDF or HTML file → enriched chunks.
+    """Run the full multi-format pipeline on one Docling-parsable file → enriched chunks.
+
+    Handles HTML, PDF, Office (DOCX/XLSX/PPTX/CSV/AsciiDoc) and images
+    (incl. GIF) through one router driven by the format registry — there is no
+    hard-coded ``if suffix == ".pdf"`` branch here.
 
     Steps:
-      1. Route: HTML → BeautifulSoup junk filter → temp file; PDF → pass through.
+      1. Route (registry): HTML → BeautifulSoup junk filter → temp file;
+         GIF → first-frame PNG; everything else → pass through to Docling.
       2. Parse: Docling (OCR + tables + LaTeX) → one Markdown string.
       3. Clean: LaTeX-safe regex noise cleaner.
-      4. Chunk: MarkdownHeaderTextSplitter (#/##/###).
-      5. Enrich: source-type-aware metadata on every chunk.
+      4. Quality gate (formats with apply_quality_gate): reject garbage docs and
+         drop individual junk chunks (alldoc.md §5). On a rejected document we
+         return ``[]`` so it is NOT recorded in the manifest and can be retried
+         after a threshold change.
+      5. Chunk: MarkdownHeaderTextSplitter (#/##/###).
+      6. Enrich: source-type-aware metadata on every chunk.
 
-    Raises ValueError for unsupported file types. Always cleans up the temp HTML
-    file even if a later step raises — the `finally` block is unconditional.
+    Raises ValueError for file types the registry does not route through Docling
+    (e.g. plain .txt/.md, or an unknown suffix). Temp files are always cleaned up.
     """
+    from graph_rag.ingestion import formats
+    from graph_rag.preprocessing.quality import assess_quality
+
     path = Path(path)
-    suffix = path.suffix.lower()
-    tmp_html: Path | None = None
+    spec = formats.get_spec(path.suffix.lower())
+    if spec is None or spec.category == formats.CATEGORY_TEXT:
+        raise ValueError(
+            f"Unsupported file type for Docling preprocessing: {path.suffix!r}"
+        )
 
+    tmp_files: list[Path] = []
     try:
-        if suffix in PDF_SUFFIXES:
-            source_type: str = "pdf"
-            parse_target: Path = path
-        elif suffix in HTML_SUFFIXES:
-            source_type = "html"
-            tmp_html = _clean_html_to_tempfile(path)      # Step 1
-            parse_target = tmp_html
+        if spec.category == formats.CATEGORY_HTML:
+            parse_target = _clean_html_to_tempfile(path)  # Step 1: BS4 junk filter
+            tmp_files.append(parse_target)
+        elif spec.pre_normalize == "gif_to_png":
+            parse_target = _normalize_gif_to_png(path)     # Step 1: GIF → PNG
+            tmp_files.append(parse_target)
         else:
-            raise ValueError(
-                f"Unsupported file type: {suffix!r} — expected .pdf or .html/.htm/.xhtml"
-            )
+            parse_target = path
 
-        markdown = _parse_to_markdown(parse_target)       # Step 2
-        markdown = clean_markdown(markdown)               # Step 3
-        chunks = chunk_markdown(markdown)                 # Step 4
-        return enrich_chunks(chunks, path, source_type)   # Step 5
+        markdown = _parse_to_markdown(parse_target)        # Step 2
+        markdown = clean_markdown(markdown)                # Step 3
+
+        if spec.apply_quality_gate:                        # Step 4
+            passed, reason = assess_quality(markdown)
+            if not passed:
+                logger.warning("quality gate rejected %s: %s", path.name, reason)
+                return []
+
+        chunks = chunk_markdown(markdown)                  # Step 5
+
+        if spec.apply_quality_gate:
+            kept = [c for c in chunks if assess_quality(c.page_content)[0]]
+            if not kept:
+                logger.warning(
+                    "quality gate rejected all %d chunk(s) of %s", len(chunks), path.name
+                )
+                return []
+            chunks = kept
+
+        return enrich_chunks(chunks, path, spec.source_type)  # Step 6
 
     finally:
-        if tmp_html is not None:
-            tmp_html.unlink(missing_ok=True)
+        for tmp in tmp_files:
+            tmp.unlink(missing_ok=True)
 
 
 # ── CLI smoke test ───────────────────────────────────────────────────────────

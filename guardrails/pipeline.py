@@ -10,11 +10,22 @@ from guardrails.retrieval.grounding_gate import CitationRegistry
 from guardrails.templates import (
     ERROR_GENERIC,
     REFUSAL_INJECTION,
+    REFUSAL_NO_CONTEXT,
     REFUSAL_OFF_TOPIC,
     REFUSAL_GENERIC,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _metric_inc(name: str, labels: dict | None = None) -> None:
+    """Best-effort metric increment — never lets observability break a request."""
+    try:
+        from observability import inc
+
+        inc(name, labels)
+    except Exception:
+        pass
 
 
 class GuardrailPipeline:
@@ -53,13 +64,22 @@ class GuardrailPipeline:
             action, category, _ = injection.check(cleaned)
             if action == "refuse":
                 self._record_abuse(session_id)
+                _metric_inc("guardrail_refusals_total", {"reason": "injection"})
                 return GuardDecision(
                     action=Action.REFUSE,
                     cleaned_text=REFUSAL_INJECTION,
                     reasons=[f"injection:{category}"],
                 )
-            if injection.check_embedding_similarity(cleaned, cfg.injection_sim_threshold):
+            is_attack, degraded = injection.embedding_similarity_status(
+                cleaned, cfg.injection_sim_threshold
+            )
+            if degraded:
+                blocked = self._on_degraded("injection", session_id)
+                if blocked is not None:
+                    return blocked
+            elif is_attack:
                 self._record_abuse(session_id)
+                _metric_inc("guardrail_refusals_total", {"reason": "injection_embedding"})
                 return GuardDecision(
                     action=Action.REFUSE,
                     cleaned_text=REFUSAL_INJECTION,
@@ -70,10 +90,17 @@ class GuardrailPipeline:
             cleaned = pii.redact(cleaned)
 
         if cfg.scope_gate:
-            in_scope, sim = scope.check(cleaned, cfg.scope_min_sim, cfg.scope_centroid_path)
-            if not in_scope:
+            in_scope, sim, degraded = scope.check_with_status(
+                cleaned, cfg.scope_min_sim, cfg.scope_centroid_path
+            )
+            if degraded:
+                blocked = self._on_degraded("scope", session_id)
+                if blocked is not None:
+                    return blocked
+            elif not in_scope:
                 logger.info("Off-topic blocked (sim=%.3f < %.3f)", sim, cfg.scope_min_sim)
                 self._record_abuse(session_id)
+                _metric_inc("guardrail_refusals_total", {"reason": "off_topic"})
                 return GuardDecision(
                     action=Action.REFUSE,
                     cleaned_text=REFUSAL_OFF_TOPIC,
@@ -81,6 +108,25 @@ class GuardrailPipeline:
                 )
 
         return GuardDecision(action=Action.ALLOW, cleaned_text=cleaned)
+
+    @staticmethod
+    def _on_degraded(check: str, session_id: str) -> Optional[GuardDecision]:
+        """Handle an embedder-dependent check that could not run (P0-5).
+
+        Always emits an observable signal (metric + WARN). Returns a REFUSE
+        decision when GUARD_EMBEDDER_REQUIRED is set (strict prod posture), else
+        None to fail open (preserving availability) — but never silently.
+        """
+        logger.warning("Guardrail '%s' ran DEGRADED (embedder unavailable).", check)
+        _metric_inc("guardrail_degraded_total", {"check": check})
+        if cfg.embedder_required:
+            _metric_inc("guardrail_refusals_total", {"reason": f"{check}_degraded"})
+            return GuardDecision(
+                action=Action.REFUSE,
+                cleaned_text=ERROR_GENERIC,
+                reasons=[f"{check}_degraded_fail_closed"],
+            )
+        return None
 
     def check_retrieval_groundable(
         self,
@@ -140,15 +186,44 @@ class GuardrailPipeline:
         if cfg.citation_verify and registry:
             answer, citations = citation_verify.verify(answer, registry)
 
+        # ── Grounding enforcement (config-driven) ───────────────────────────
+        # Detect ungrounded numbers and sentences, then ACT on them per
+        # GUARD_GROUNDING_ACTION: "flag" (log only, legacy), "strip" (remove the
+        # ungrounded sentences, refusing if too little survives), or "refuse"
+        # (any ungrounded content → canonical refusal). Strips the spec
+        # hallucinations that previously reached the user.
+        bad_nums: List[str] = []
         if context:
             _, bad_nums = grounding_check.check_numeric_grounding(answer, context)
             if bad_nums:
                 reasons.append(f"ungrounded_numbers:{len(bad_nums)}")
 
+        ungrounded: List[str] = []
         if passages and cfg.grounding_min_sim > 0:
             _, ungrounded = grounding_check.check_sentence_grounding(answer, passages, cfg.grounding_min_sim)
             if ungrounded:
                 reasons.append(f"ungrounded_sentences:{len(ungrounded)}")
+
+        action = (cfg.grounding_action or "flag").lower()
+        if action != "flag" and (bad_nums or ungrounded):
+            total = max(1, len(grounding_check._factual_sentences(answer)))
+            over_ratio = len(ungrounded) / total > cfg.grounding_max_ungrounded_ratio
+            if action == "refuse" or (bad_nums and not ungrounded) or over_ratio:
+                # Bare fabricated numbers, an over-the-ratio answer, or refuse-mode
+                # → don't try to salvage; refuse outright.
+                reasons.append("grounding_refused")
+                return REFUSAL_NO_CONTEXT, [], reasons
+            if action == "strip" and ungrounded:
+                stripped = grounding_check.strip_ungrounded(answer, ungrounded)
+                if not stripped:
+                    reasons.append("grounding_refused")
+                    return REFUSAL_NO_CONTEXT, [], reasons
+                if stripped != answer:
+                    reasons.append("grounding_stripped")
+                    # Re-verify citations against the trimmed answer.
+                    if cfg.citation_verify and registry:
+                        stripped, citations = citation_verify.verify(stripped, registry)
+                answer = stripped
 
         if cfg.pii_output:
             answer = pii_out.redact_output(answer)

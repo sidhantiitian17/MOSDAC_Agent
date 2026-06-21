@@ -60,9 +60,19 @@ def build_graph_rag_chain(retriever: HybridRetriever | None = None, llm=None, co
     def _retrieve(payload: dict) -> dict:
         question = payload["question"]
         history = payload.get("history", "")
-        # History-aware retrieval: rewrite a follow-up into a standalone query so
-        # retrieval targets the right entity. The user's literal question (below)
-        # is unchanged — only the search query is contextualized.
+
+        # Use pre-retrieved context when available (passed from service.py after
+        # the L2 grounding gate) to avoid a second round-trip to the retriever.
+        if "pre_retrieved" in payload:
+            pre = payload["pre_retrieved"]
+            return {
+                "graph_context": pre.get("graph_context", ""),
+                "vector_context": pre.get("vector_context", ""),
+                "question": question,
+                "history": f"{history}\n\n" if history else "",
+            }
+
+        # Standalone path: history-aware retrieval without a pre-fetched context.
         search_query = contextualizer.contextualize(question, history).search_query
         ctx = retriever.retrieve(search_query)
         return {

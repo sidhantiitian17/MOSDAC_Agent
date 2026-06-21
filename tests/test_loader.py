@@ -28,8 +28,9 @@ def test_load_text_file(tmp_path: Path):
 
 
 def test_unsupported_extension(tmp_path: Path):
-    f = tmp_path / "image.png"
-    f.write_bytes(b"\x89PNG\r\n")
+    # .png is now a supported (image/OCR) format — use a genuinely unknown suffix.
+    f = tmp_path / "data.xyz"
+    f.write_bytes(b"\x00\x01\x02")
     assert load_file(f) == []
 
 

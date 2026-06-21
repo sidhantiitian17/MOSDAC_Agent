@@ -32,10 +32,15 @@ class ChromaStore:
         self._persist_dir = persist_dir or settings.chroma_persist_dir
         Path(self._persist_dir).mkdir(parents=True, exist_ok=True)
 
+        # Pin the HNSW distance to cosine so distance→relevance conversion is
+        # well-defined (relevance = 1 - cosine_distance). This metadata is only
+        # honoured when the collection is FIRST created; an existing collection
+        # keeps whatever space it was built with (re-ingest to migrate).
         self._store = Chroma(
             collection_name=self._collection_name,
             embedding_function=embedder,
             persist_directory=self._persist_dir,
+            collection_metadata={"hnsw:space": "cosine"},
         )
 
     @property
@@ -88,11 +93,87 @@ class ChromaStore:
     def similarity_search_with_score(self, query: str, k: int | None = None) -> list[tuple[Document, float]]:
         return self._store.similarity_search_with_score(query, k=k or settings.top_k_vector)
 
+    def similarity_search_with_relevance(
+        self, query: str, k: int | None = None
+    ) -> list[tuple[Document, float]]:
+        """Return (doc, relevance) with relevance normalized to [0, 1], higher=better.
+
+        LangChain maps the collection's distance to a relevance score using the
+        space-appropriate function (cosine → ``1 - distance``). We clamp to [0, 1]
+        because the mapping can fall slightly outside the range for un-normalized
+        vectors, and the grounding gate expects a clean [0, 1] floor.
+        """
+        k = k or settings.top_k_vector
+        try:
+            results = self._store.similarity_search_with_relevance_scores(query, k=k)
+        except Exception:
+            # Fall back to raw distances and convert (assumes cosine space).
+            results = [
+                (doc, 1.0 - float(dist))
+                for doc, dist in self._store.similarity_search_with_score(query, k=k)
+            ]
+        return [(doc, max(0.0, min(1.0, float(rel)))) for doc, rel in results]
+
+    def get_all_chunks(self) -> dict:
+        """Return the raw {ids, documents, metadatas} for the whole collection.
+
+        Single accessor used by BM25 index building and by parent-section
+        expansion so callers don't reach into the private ``_collection``.
+        """
+        try:
+            return self._store._collection.get(include=["documents", "metadatas"])
+        except Exception as exc:
+            logger.warning("get_all_chunks failed: %s", exc)
+            return {"ids": [], "documents": [], "metadatas": []}
+
+    def get_by_metadata(self, where: dict) -> dict:
+        """Fetch chunks matching a metadata filter (e.g. {'parent_id': '…'})."""
+        try:
+            return self._store._collection.get(
+                where=where, include=["documents", "metadatas"]
+            )
+        except Exception as exc:
+            logger.debug("get_by_metadata(%s) failed: %s", where, exc)
+            return {"ids": [], "documents": [], "metadatas": []}
+
     def count(self) -> int:
         try:
             return self._store._collection.count()
         except Exception:
             return 0
+
+    def check_embedding_compat(self) -> None:
+        """Raise RuntimeError if stored vector dim differs from the current embedder.
+
+        Skipped when the collection is empty (nothing to compare) or when the
+        embedder is unavailable at startup (exception → WARNING, no crash).
+        """
+        if self.count() == 0 or self._embedder is None:
+            return
+        try:
+            stored = self._store._collection.get(limit=1, include=["embeddings"])
+            stored_embs = stored.get("embeddings") or []
+            if not stored_embs:
+                return
+            stored_dim = len(stored_embs[0])
+            probe_dim = len(self._embedder.embed_query("test"))
+            if stored_dim != probe_dim:
+                raise RuntimeError(
+                    f"Embedding dimension mismatch: ChromaDB collection "
+                    f"'{self._collection_name}' stores {stored_dim}-dim vectors "
+                    f"but the current embedder produces {probe_dim}-dim vectors. "
+                    f"Re-ingest the corpus with the current embedder or switch "
+                    f"back to the embedder that was used at ingest time."
+                )
+            logger.info(
+                "Embedding compat OK: collection '%s' dim=%d",
+                self._collection_name,
+                stored_dim,
+            )
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            logger.warning("Could not verify embedding compatibility: %s", exc)
 
     def reset(self) -> None:
         """Drop the entire collection (destructive)."""

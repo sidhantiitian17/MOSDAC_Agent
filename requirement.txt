@@ -54,10 +54,30 @@ tqdm
 typer>=0.12
 requests>=2.31
 
+# ── Evaluation (RAGAS production gate — see evaluation_plan.md) ────────────────
+# RAGAS provides the LLM-judged retrieval/generation metrics (faithfulness,
+# context precision/recall, entity recall, noise sensitivity, factual correctness,
+# response relevancy, semantic similarity). `datasets` backs ragas' EvaluationDataset.
+# The judge LLM + embeddings are wired through langchain (already present) so the
+# judge can be a stronger model than the local generator under test.
+# Pinned to the 0.2 line: ragas 0.2.x targets the langchain 0.3 stack this project
+# uses. Do NOT unpin to >=0.4 — that drags langchain up to 1.x and breaks
+# langchain-chroma / langchain-neo4j (which are 0.3-era here).
+ragas>=0.2,<0.3
+datasets>=2.0,<4
+
 # Testing
 pytest>=8.0
 pytest-mock>=3.12
 httpx>=0.27          # required by fastapi.testclient
 
-# Optional — pluggable session backend
-# redis>=5.0         # uncomment to enable CHAT_API_SESSION_BACKEND=redis
+# Rate limiting (required — SlowAPIMiddleware enforces per-IP limits on /chat)
+slowapi>=0.1.9
+
+# Observability — Prometheus /metrics. Optional: observability/metrics.py degrades
+# to an in-process fallback if this is absent, but install it in production.
+prometheus-client>=0.20
+
+# Optional — pluggable session backend. REQUIRED for multi-replica / persistent
+# sessions (CHAT_API_SESSION_BACKEND=redis). See production.md.
+redis>=5.0

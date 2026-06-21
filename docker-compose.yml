@@ -2,7 +2,7 @@
 # ║  MOSDAC GraphRAG — OFFLINE STACK                                             ║
 # ║                                                                              ║
 # ║  LLM:        Tabby ML runs as its OWN container, started separately.         ║
-# ║  Embeddings: BAAI/bge-large-en-v1.5 (1024-dim), from ./models_cache.         ║
+# ║  Embeddings: bge-large via Ollama HTTP (/api/embeddings on host port 11434). ║
 # ║  Graph:      Neo4j 5.18.0 with NEO4J_AUTH=none.                              ║
 # ║                                                                              ║
 # ║  Start:   docker compose up --build                                          ║
@@ -40,6 +40,20 @@ services:
       retries: 10
       start_period: 60s
 
+  # ── Redis (persistent, multi-replica session store) ──────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: mosdac_redis
+    restart: unless-stopped
+    command: ["redis-server", "--save", "60", "1", "--appendonly", "no"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
   # ── FastAPI Chat Gateway ─────────────────────────────────────────────────────
   chat_api:
     build:
@@ -55,24 +69,40 @@ services:
       # Inside the compose network, reach Neo4j by its service name — overrides
       # the bolt://localhost:7687 value carried in .env.
       NEO4J_URI: bolt://neo4j:7687
-      # chat_api runs in a container; Tabby ML runs elsewhere. The .env value
-      # http://localhost:8080 is NOT reachable from inside the container, so
-      # override it here. Default assumes Tabby on the Docker host; for ISRO,
-      # set TABBY_BASE_URL_DOCKER in .env to Tabby's LAN address.
+      # chat_api runs in a container; Tabby ML and Ollama run on the host.
+      # localhost inside the container means the container itself, so override
+      # both services to use host.docker.internal (or a LAN address for ISRO).
       TABBY_BASE_URL: ${TABBY_BASE_URL_DOCKER:-http://host.docker.internal:8080/v1}
+      # Fix Bug #2: OLLAMA_BASE_URL was missing — container localhost ≠ host port 11434.
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL_DOCKER:-http://host.docker.internal:11434}
+      # Persistent sessions (production.md P0-2): use Redis by service name so a
+      # multi-worker/replica deploy never splits session state across workers.
+      CHAT_API_SESSION_BACKEND: ${CHAT_API_SESSION_BACKEND:-redis}
+      CHAT_API_REDIS_URL: ${CHAT_API_REDIS_URL:-redis://redis:6379/0}
+      CHAT_API_REQUIRE_PERSISTENT_SESSIONS: ${CHAT_API_REQUIRE_PERSISTENT_SESSIONS:-true}
     extra_hosts:
       - "host.docker.internal:host-gateway"   # lets the container reach host Tabby
     volumes:
       - ./chroma_db:/app/chroma_db
       - ./prompts:/app/prompts
-      - ./models_cache:/app/models_cache:ro   # pre-downloaded BGE model (offline)
       - ${DOWNLOADS_DIR:-./downloads}:/app/downloads:ro
       - ${ATLASES_DIR:-./atlases_pdfs}:/app/atlases:ro
+    # Readiness-aware healthcheck (P0-4): the LB / orchestrator only routes traffic
+    # once embedder + Chroma + Neo4j actually answer, not merely when the port opens.
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/ready', timeout=5).status==200 else 1)\" || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
     depends_on:
       neo4j:
+        condition: service_healthy
+      redis:
         condition: service_healthy
 
 volumes:
   neo4j_logs:
+  redis_data:
   # neo4j_data is a host bind mount (./neo4j_data) — not a named volume.
   # ollama_data and hf_cache removed — Tabby ML runs as a separate container.

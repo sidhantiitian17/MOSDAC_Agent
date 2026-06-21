@@ -257,30 +257,290 @@ def test_config_endpoint(test_client):
     assert "screenshot_enabled" in body
 
 
+_SID1 = "00000000-0000-0000-0000-000000000001"
+_SID2 = "00000000-0000-0000-0000-000000000002"
+_SID3 = "00000000-0000-0000-0000-000000000003"
+
+
 def test_chat_text_only_endpoint(test_client):
     client, sessions = test_client
-    r = client.post("/chat", json={"session_id": "u1", "message": "hi there"})
+    r = client.post("/chat", json={"session_id": _SID1, "message": "hi there"})
     assert r.status_code == 200
     body = r.json()
     assert body["answer"] == "mock-answer"
-    assert body["session_id"] == "u1"
-    assert len(sessions.get("u1")) == 2
+    assert body["session_id"] == _SID1
+    assert len(sessions.get(_SID1)) == 2
 
 
 def test_chat_clear_endpoint(test_client):
     client, sessions = test_client
-    client.post("/chat", json={"session_id": "u2", "message": "hi there"})
-    assert sessions.get("u2")
-    r = client.delete("/chat/u2")
+    client.post("/chat", json={"session_id": _SID2, "message": "hi there"})
+    assert sessions.get(_SID2)
+    r = client.delete(f"/chat/{_SID2}")
     assert r.status_code == 200
-    assert sessions.get("u2") == []
+    assert sessions.get(_SID2) == []
 
 
 def test_chat_bad_request_on_invalid_screenshot(test_client):
     client, _ = test_client
     r = client.post("/chat", json={
-        "session_id": "u3",
+        "session_id": _SID3,
         "message": "look at this",
         "screenshot_base64": "!!!!notbase64!!!",
     })
     assert r.status_code == 400
+
+
+# ── New tests (§6 gaps from backend.md) ─────────────────────────────────────
+
+def test_invalid_session_id_returns_422(test_client):
+    """Non-UUID session_id must be rejected at the model layer (422 Unprocessable)."""
+    client, _ = test_client
+    r = client.post("/chat", json={"session_id": "not-a-uuid", "message": "hello"})
+    assert r.status_code == 422
+    assert "session_id" in r.text.lower() or "uuid" in r.text.lower()
+
+
+def test_service_refuses_when_no_groundable_hits():
+    """When the retriever returns no hits the grounding gate must set refused=True."""
+    from chat_api.service import ChatService
+    from chat_api.session import InMemorySessionStore
+
+    retriever = MagicMock()
+    retriever.retrieve.return_value = {
+        "graph_context": "",
+        "vector_context": "(no relevant passages found)",
+        "_hits": [],  # empty → grounding gate fails
+    }
+    chain = MagicMock()
+    sessions = InMemorySessionStore()
+    service = ChatService(
+        retriever=retriever,
+        chain=chain,
+        llm=MagicMock(),
+        sessions=sessions,
+    )
+    answer, citations, grounded, refused = service.chat(
+        session_id="s-refusal",
+        message="What is INSAT resolution?",
+    )
+    assert refused is True
+    assert grounded is False
+    chain.invoke.assert_not_called()
+
+
+def test_service_refuses_when_hits_below_min_score():
+    """Hits with score below retrieval_min_score (0.20) must trigger refusal."""
+    from chat_api.service import ChatService
+    from chat_api.session import InMemorySessionStore
+
+    retriever = MagicMock()
+    retriever.retrieve.return_value = {
+        "graph_context": "",
+        "vector_context": "[Source: weak.pdf | score=0.0500]\nweak match",
+        "_hits": [
+            VectorHit(text="weak match", source="weak.pdf", score=0.05, chunk_id="w1"),
+        ],
+    }
+    chain = MagicMock()
+    sessions = InMemorySessionStore()
+    service = ChatService(
+        retriever=retriever,
+        chain=chain,
+        llm=MagicMock(),
+        sessions=sessions,
+    )
+    answer, citations, grounded, refused = service.chat(
+        session_id="s-low-score",
+        message="What is INSAT resolution?",
+    )
+    assert refused is True
+    assert grounded is False
+    chain.invoke.assert_not_called()
+
+
+def test_image_path_goes_through_check_output(monkeypatch):
+    """_answer_with_image must call pipeline.check_output() (Bug #4 fix)."""
+    from chat_api.service import ChatService
+    from chat_api.session import InMemorySessionStore
+    from guardrails import get_pipeline
+
+    pipeline = get_pipeline()
+    called_with = {}
+
+    original_check_output = pipeline.check_output
+
+    def spy_check_output(answer, registry, passages=None, context=""):
+        called_with["fired"] = True
+        called_with["answer"] = answer
+        return original_check_output(answer, registry, passages, context)
+
+    monkeypatch.setattr(pipeline, "check_output", spy_check_output)
+
+    retriever = MagicMock()
+    retriever.retrieve.return_value = {
+        "graph_context": "g",
+        "vector_context": "v",
+        "_hits": [VectorHit(text="v", source="s.pdf", score=0.9, chunk_id="c1")],
+    }
+    llm = MagicMock()
+    resp = MagicMock()
+    resp.content = "image-answer"
+    llm.invoke.return_value = resp
+
+    service = ChatService(
+        retriever=retriever,
+        chain=MagicMock(),
+        llm=llm,
+        sessions=InMemorySessionStore(),
+    )
+
+    b64 = base64.b64encode(b"fake-image-bytes").decode()
+    service.chat(
+        session_id="s-img",
+        message="What is shown here?",
+        screenshot_b64=b64,
+        screenshot_mime="image/png",
+    )
+    assert called_with.get("fired"), "check_output was never called on the image path"
+
+
+def test_security_headers_on_response(test_client):
+    """Every response must carry OWASP-recommended security headers."""
+    client, _ = test_client
+    r = client.get("/health")
+    assert r.headers.get("x-content-type-options") == "nosniff"
+    assert r.headers.get("x-frame-options") == "DENY"
+    assert r.headers.get("referrer-policy") == "no-referrer"
+    assert "frame-ancestors" in r.headers.get("content-security-policy", "")
+
+
+def test_cors_preflight_from_allowed_origin(test_client):
+    """OPTIONS /chat from an allowed origin must receive CORS allow headers."""
+    client, _ = test_client
+    r = client.options(
+        "/chat",
+        headers={
+            "Origin": "http://localhost",
+            "Access-Control-Request-Method": "POST",
+        },
+    )
+    assert r.status_code in (200, 204)
+    assert "http://localhost" in r.headers.get("access-control-allow-origin", "")
+
+
+def test_screenshot_corrupt_tail_rejected(test_client):
+    """A b64 payload with a valid prefix but corrupt tail must now be rejected (Bug #10 fix)."""
+    import base64 as _b64
+    client, _ = test_client
+    # Build a valid b64 prefix longer than 256 chars, then append garbage
+    valid_prefix = _b64.b64encode(b"A" * 200).decode()  # 268 chars — spans the old 256-char window
+    corrupt_payload = valid_prefix + "!@#$"             # invalid b64 beyond the first 256 chars
+    r = client.post("/chat", json={
+        "session_id": "00000000-0000-0000-0000-000000000099",
+        "message": "look at this",
+        "screenshot_base64": corrupt_payload,
+    })
+    assert r.status_code == 400
+
+
+# ── Tests for Bugs #5 / #7 / #9 ─────────────────────────────────────────────
+
+def test_chain_receives_pre_retrieved_context():
+    """chain.invoke() must receive 'pre_retrieved' and retriever called only once (Bug #5 fix)."""
+    from chat_api.service import ChatService
+    from chat_api.session import InMemorySessionStore
+
+    retriever = MagicMock()
+    retriever.retrieve.return_value = {
+        "graph_context": "G",
+        "vector_context": "V",
+        "_hits": [VectorHit(text="V", source="s.pdf", score=0.9, chunk_id="c1")],
+    }
+    chain = MagicMock()
+    chain.invoke.return_value = "answer"
+    service = ChatService(
+        retriever=retriever,
+        chain=chain,
+        llm=MagicMock(),
+        sessions=InMemorySessionStore(),
+    )
+    service.chat(session_id="s-pre", message="hello")
+
+    # retriever.retrieve must be called exactly once (grounding gate only)
+    assert retriever.retrieve.call_count == 1, (
+        f"retriever.retrieve called {retriever.retrieve.call_count} times; expected 1"
+    )
+    # chain.invoke must have received pre_retrieved
+    call_kwargs = chain.invoke.call_args[0][0]
+    assert "pre_retrieved" in call_kwargs, "chain.invoke missing 'pre_retrieved' key"
+    assert call_kwargs["pre_retrieved"]["graph_context"] == "G"
+    assert call_kwargs["pre_retrieved"]["vector_context"] == "V"
+
+
+def test_cors_default_origins_include_common_dev_ports():
+    """Default ChatAPISettings must include port-specific origins (Bug #7 fix).
+
+    The .env file on a given machine may override CHAT_API_ALLOWED_ORIGINS, so
+    we test the code-level default directly by constructing ChatAPISettings
+    without reading any env file.
+    """
+    from chat_api.config import ChatAPISettings
+
+    fresh = ChatAPISettings(_env_file=None)
+    origins = fresh.origins_list()
+    assert "http://localhost:3000" in origins, f"port-3000 missing from defaults: {origins}"
+    assert "http://localhost:5173" in origins, f"port-5173 (Vite) missing from defaults: {origins}"
+    assert "http://localhost:8080" in origins, f"port-8080 missing from defaults: {origins}"
+
+
+def test_cors_preflight_from_localhost_with_port():
+    """OPTIONS from http://localhost:3000 with explicit settings must return 200 (Bug #7 fix)."""
+    from unittest.mock import patch
+
+    from fastapi.testclient import TestClient
+
+    from chat_api.config import ChatAPISettings
+    from chat_api.main import create_app
+    from chat_api.service import ChatService
+    from chat_api.session import InMemorySessionStore
+
+    fresh_settings = ChatAPISettings(_env_file=None)
+
+    retriever = MagicMock()
+    retriever.retrieve.return_value = {
+        "graph_context": "g",
+        "vector_context": "[Source: t.pdf | score=0.9]\npassage.",
+        "_hits": [VectorHit(text="passage.", source="t.pdf", score=0.9, chunk_id="c1")],
+    }
+    chain = MagicMock()
+    chain.invoke.return_value = "answer"
+    service = ChatService(
+        retriever=retriever, chain=chain, llm=MagicMock(),
+        sessions=InMemorySessionStore(),
+    )
+
+    with patch("chat_api.main.chat_api_settings", fresh_settings):
+        app = create_app(service=service)
+
+    client = TestClient(app)
+    r = client.options(
+        "/chat",
+        headers={
+            "Origin": "http://localhost:3000",
+            "Access-Control-Request-Method": "POST",
+        },
+    )
+    assert r.status_code in (200, 204)
+    assert "http://localhost:3000" in r.headers.get("access-control-allow-origin", "")
+
+
+def test_get_llm_is_zero_arg_singleton():
+    """get_llm() must take no arguments and return the same object on repeated calls (Bug #9 fix)."""
+    import inspect
+    from graph_rag.llm.tabby_client import get_llm
+
+    sig = inspect.signature(get_llm)
+    assert len(sig.parameters) == 0, (
+        f"get_llm should have 0 parameters, got: {list(sig.parameters)}"
+    )

@@ -8,6 +8,7 @@ from typing import Iterator
 from langchain_core.documents import Document
 
 from graph_rag.config import settings
+from graph_rag.ingestion import formats
 from graph_rag.ingestion.manifest import IngestionManifest, compute_file_hash
 
 logger = logging.getLogger(__name__)
@@ -17,10 +18,9 @@ logger = logging.getLogger(__name__)
 logging.getLogger("pypdf.generic._data_structures").setLevel(logging.ERROR)
 logging.getLogger("pypdf._reader").setLevel(logging.ERROR)
 
-PDF_SUFFIXES = {".pdf"}
-HTML_SUFFIXES = {".html", ".htm", ".xhtml"}
-TEXT_SUFFIXES = {".txt", ".md"}
-SUPPORTED_SUFFIXES = PDF_SUFFIXES | HTML_SUFFIXES | TEXT_SUFFIXES
+# All file-format routing (which suffixes are supported, how each is loaded, what
+# source_type it is tagged with) is declared once in graph_rag/ingestion/formats.py.
+# Adding a format is a registry row there — no edits to the dispatch below.
 
 
 def _mute_fitz_stderr() -> None:
@@ -70,7 +70,7 @@ def _docling_eligible(path: Path) -> bool:
     return True
 
 
-def _load_pdf(path: Path) -> list[Document]:
+def _load_pdf(path: Path, source_type: str = "pdf") -> list[Document]:
     # ── Primary: Docling — structured Markdown with math + tables + OCR ────────
     if settings.use_docling and _docling_eligible(path):
         try:
@@ -86,7 +86,7 @@ def _load_pdf(path: Path) -> list[Document]:
             # so split_documents() passes them through without re-splitting.
             markdown = clean_markdown(markdown)
             chunks = chunk_markdown(markdown)
-            return enrich_chunks(chunks, path, "pdf")
+            return enrich_chunks(chunks, path, source_type)
         except Exception as exc:
             logger.warning(
                 "Docling failed for %s (%s) — falling back to cascade", path.name, exc
@@ -218,37 +218,69 @@ def _load_text(path: Path) -> list[Document]:
         return []
 
 
-def load_file(path: Path) -> list[Document]:
-    """Dispatch to the right loader based on suffix; tag metadata for traceability."""
-    suffix = path.suffix.lower()
-    if suffix in PDF_SUFFIXES:
-        file_type = "pdf"
-        docs = _load_pdf(path)
-    elif suffix in HTML_SUFFIXES:
-        file_type = "html"
-        docs = _load_html(path)
-    elif suffix in TEXT_SUFFIXES:
-        file_type = "text"
-        docs = _load_text(path)
-    else:
+def _load_via_docling(path: Path, spec: formats.FormatSpec) -> list[Document]:
+    """Generic loader for every new Docling format (Office/CSV/AsciiDoc/images/GIF).
+
+    Routes through the full preprocessing pipeline (parse → clean → quality gate
+    → chunk → enrich). Honours the per-format size cap and never raises: a parse
+    failure is logged and yields ``[]`` so one bad file can't abort the run.
+    """
+    ok, reason = formats.within_size_limit(spec, path)
+    if not ok:
+        logger.info("Skipping %s (%s)", path.name, reason)
         return []
+    try:
+        from graph_rag.preprocessing.preprocessor import preprocess_file
+        return preprocess_file(path)
+    except Exception as exc:
+        logger.warning("Docling ingestion failed for %s (%s) — skipping", path.name, exc)
+        return []
+
+
+# Dispatch table: routing category → handler. Keeps load_file free of any
+# hard-coded suffix or source_type literal.
+_CATEGORY_LOADERS = {
+    formats.CATEGORY_PDF: lambda path, spec: _load_pdf(path, spec.source_type),
+    formats.CATEGORY_HTML: lambda path, spec: _load_html(path),
+    formats.CATEGORY_TEXT: lambda path, spec: _load_text(path),
+    formats.CATEGORY_DOCLING: _load_via_docling,
+}
+
+
+def load_file(path: Path) -> list[Document]:
+    """Dispatch to the right loader via the format registry; tag metadata for traceability."""
+    spec = formats.get_spec(path.suffix.lower())
+    if spec is None or not formats.is_enabled(spec):
+        return []  # unknown suffix or a disabled category (e.g. images off)
+
+    handler = _CATEGORY_LOADERS.get(spec.category)
+    if handler is None:
+        return []
+    docs = handler(path, spec)
 
     for d in docs:
         d.metadata.setdefault("source", str(path))
-        d.metadata["file_type"] = file_type
+        # file_type carries the canonical source_type from the registry, so
+        # loader and preprocessor metadata always agree (pdf/html/docx/image/…).
+        d.metadata["file_type"] = spec.source_type
         d.metadata["file_name"] = path.name
     return docs
 
 
 def iter_source_files(folders: list[Path] | None = None) -> Iterator[Path]:
-    """Yield every supported (PDF/HTML/text) file under the configured folders."""
+    """Yield every currently-enabled file under the configured folders.
+
+    The supported-suffix set is resolved from the registry on each call, so the
+    office/image kill-switches take effect without restarting or code changes.
+    """
     folders = folders or settings.source_folders()
+    supported = formats.supported_suffixes()
     for folder in folders:
         if not folder.exists():
             logger.warning("Source folder does not exist: %s", folder)
             continue
         for path in folder.rglob("*"):
-            if path.is_file() and path.suffix.lower() in SUPPORTED_SUFFIXES:
+            if path.is_file() and path.suffix.lower() in supported:
                 yield path
 
 

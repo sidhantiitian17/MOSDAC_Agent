@@ -39,9 +39,14 @@ class Neo4jStore:
         except ImportError as exc:
             raise ImportError("neo4j driver not installed. Run: pip install neo4j") from exc
 
+        # Bounded pool + timeouts (P2-4) so a slow/bouncing Neo4j can't exhaust
+        # connections or hang a request indefinitely. All env-driven.
         self._driver = GraphDatabase.driver(
             uri or settings.neo4j_uri,
             auth=(username or settings.neo4j_username, password or settings.neo4j_password),
+            max_connection_pool_size=settings.neo4j_max_pool_size,
+            connection_acquisition_timeout=settings.neo4j_connection_timeout,
+            max_connection_lifetime=settings.neo4j_max_connection_lifetime,
         )
         self._database = database or settings.neo4j_database
 

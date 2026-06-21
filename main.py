@@ -9,7 +9,8 @@ Commands:
     python main.py ingest --skip-graph     # Chroma only, no Neo4j writes
     python main.py chat                    # interactive REPL
     python main.py test                    # health-check every component
-    python main.py eval                    # run the evaluation harness (Phase 0)
+    python main.py eval                    # run the legacy Phase-0 harness (cheap, deterministic)
+    python main.py ragas-eval              # run the RAGAS production gate (evaluation_plan.md)
     python main.py build-communities       # build GraphRAG community summaries (Phase 6)
 """
 from __future__ import annotations
@@ -124,38 +125,18 @@ def cmd_test() -> int:
         print(f"  FAILED: {exc}")
         ok = False
 
-    print("\nChecking embedder...")
+    # Shared dependency probes — the SAME code the API /ready endpoint uses (P0-4),
+    # so the CLI smoke test and the live readiness check can never drift apart.
+    print("\nChecking dependencies (embedder / ChromaDB / Neo4j / LLM)...")
     try:
-        from graph_rag.embeddings import get_embedder
+        from graph_rag.health import readiness
 
-        emb = get_embedder()
-        vec = emb.embed_query("hello world")
-        print(f"  embedding dimension = {len(vec)}")
-    except Exception as exc:
-        print(f"  FAILED: {exc}")
-        ok = False
-
-    print("\nChecking ChromaDB...")
-    try:
-        from graph_rag.vector_store.chroma_store import ChromaStore
-        from graph_rag.embeddings import get_embedder
-
-        store = ChromaStore(embedder=get_embedder())
-        print(f"  count = {store.count()}")
-    except Exception as exc:
-        print(f"  FAILED: {exc}")
-        ok = False
-
-    print("\nChecking Neo4j...")
-    try:
-        from graph_rag.knowledge_graph.neo4j_store import Neo4jStore
-
-        with Neo4jStore() as neo:
-            alive = neo.ping()
-            print(f"  ping = {alive}")
-            if alive:
-                print(f"  schema = {neo.schema_report()}")
-            else:
+        report = readiness(cache_seconds=0.0, include_llm=True)
+        for name, res in report["checks"].items():
+            status = "ok" if res["ok"] else "FAILED"
+            print(f"  {name:10s} = {status} ({res['detail']})")
+            # LLM is a soft dependency for readiness but a hard one for the smoke test.
+            if not res["ok"]:
                 ok = False
     except Exception as exc:
         print(f"  FAILED: {exc}")
@@ -215,6 +196,61 @@ def cmd_eval(argv: list[str] | None = None) -> int:
     return 0
 
 
+def cmd_ragas_eval(argv: list[str] | None = None) -> int:
+    """Run the RAGAS production gate (evaluation_plan.md).
+
+    Flags:
+        --gold PATH     golden dataset file or dir (default tests/eval/golden/v1)
+        --config NAME   PROD (default) or RAW (guards flag-only) or BOTH
+        --smoke         cheaper metric subset for fast iteration / CI tripwire
+        --limit N       evaluate only the first N items
+        --out DIR       output directory (default eval_runs)
+        --kappa F       judge↔human agreement to feed the gate (else SKIP)
+
+    Requires a configured judge (RAGAS_JUDGE_MODEL, …) and the live pipeline
+    (Chroma/Neo4j/Tabby). See §4 of the plan.
+    """
+    from dotenv import load_dotenv
+
+    from graph_rag.eval.dataset import DEFAULT_GOLDEN_DIR, load_golden
+    from graph_rag.eval.ragas_runner import run_gate
+
+    load_dotenv()
+    argv = argv or []
+    gold = DEFAULT_GOLDEN_DIR
+    config = "PROD"
+    smoke = "--smoke" in argv
+    out = "eval_runs"
+    limit: int | None = None
+    kappa: float | None = None
+    for i, a in enumerate(argv):
+        if a == "--gold" and i + 1 < len(argv):
+            gold = argv[i + 1]
+        elif a == "--config" and i + 1 < len(argv):
+            config = argv[i + 1].upper()
+        elif a == "--out" and i + 1 < len(argv):
+            out = argv[i + 1]
+        elif a == "--limit" and i + 1 < len(argv):
+            limit = int(argv[i + 1])
+        elif a == "--kappa" and i + 1 < len(argv):
+            kappa = float(argv[i + 1])
+
+    items = load_golden(gold)
+    if limit is not None:
+        items = items[:limit]
+    configs = ["PROD", "RAW"] if config == "BOTH" else [config]
+
+    overall_go = True
+    for cfg in configs:
+        print(f"\n=== RAGAS gate: {cfg} config · {len(items)} items · smoke={smoke} ===")
+        bundle = run_gate(items, config_name=cfg, smoke=smoke, out_dir=out, judge_kappa=kappa)
+        card = bundle.go_scorecard()
+        print(card.render())
+        if cfg == "PROD":
+            overall_go = card.go
+    return 0 if overall_go else 1
+
+
 def cmd_build_communities(argv: list[str] | None = None) -> int:
     """Build GraphRAG community summaries. Flags: --limit N, --min-degree N"""
     from graph_rag.knowledge_graph.community import CommunitySummarizer
@@ -247,6 +283,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_test()
     if cmd == "eval":
         return cmd_eval(argv[1:])
+    if cmd == "ragas-eval":
+        return cmd_ragas_eval(argv[1:])
     if cmd == "build-communities":
         return cmd_build_communities(argv[1:])
     print(f"Unknown command: {cmd}")

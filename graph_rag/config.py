@@ -20,6 +20,11 @@ class Settings(BaseSettings):
     neo4j_username: str = "neo4j"
     neo4j_password: str = "neo4j_password"
     neo4j_database: str = "neo4j"
+    # Driver connection pool / timeout tuning (P2-4). Bounds resource use and
+    # prevents indefinite hangs if Neo4j is slow or bouncing. All env-driven.
+    neo4j_max_pool_size: int = 50
+    neo4j_connection_timeout: float = 30.0
+    neo4j_max_connection_lifetime: float = 3600.0
 
     # ChromaDB
     chroma_persist_dir: str = "./chroma_db"
@@ -53,6 +58,22 @@ class Settings(BaseSettings):
     # Cap pages parsed per document (0 = no cap). Bounds worst-case memory/time.
     docling_max_pages: int = 0
 
+    # ── Universal multi-format ingestion ────────────────────────────────────
+    # Kill-switches for whole format families (registry: graph_rag/ingestion/
+    # formats.py). Flip to False to stop discovering/parsing that category — no
+    # code change needed. Core PDF/HTML/text are always on.
+    ingest_enable_office: bool = True   # .docx / .xlsx / .pptx / .csv / .adoc
+    ingest_enable_images: bool = True   # .png / .jpg / .tiff / .bmp / .webp / .gif (OCR)
+    ingest_image_max_mb: int = 50       # skip oversized images (OOM guard)
+
+    # Garbage-data quality gate (graph_rag/preprocessing/quality.py). All gates
+    # are config-driven so a noisy corpus can be tuned without code edits.
+    ingest_min_chars: int = 40             # drop near-empty extractions
+    ingest_min_alnum_ratio: float = 0.50   # drop OCR gibberish / binary noise
+    ingest_min_unique_tokens: int = 8      # drop degenerate repetition
+    ingest_max_repeat_ratio: float = 0.40  # drop "the the the…" loops
+    ingest_max_replacement_ratio: float = 0.10  # drop replacement/control-char soup
+
     # Data source folders (HTML + PDF ingestion)
     downloads_dir: str = "./downloads"
     atlases_dir: str = "./atlases_pdfs"
@@ -64,6 +85,12 @@ class Settings(BaseSettings):
     # Chunking
     chunk_size: int = 800
     chunk_overlap: int = 100
+    # Cap on a single header-section chunk. Sections longer than this are
+    # sub-split (math/table-safe, with overlap) so they stay within the
+    # embedder's context window and remain fully searchable. Set
+    # enable_section_subsplit=False to restore whole-section chunking.
+    chunk_max_section_chars: int = 1600
+    enable_section_subsplit: bool = True
 
     # Retrieval
     top_k_vector: int = 5
@@ -71,6 +98,33 @@ class Settings(BaseSettings):
     graph_depth: int = 2
     top_k_bm25: int = 5
     hybrid_rrf_k: int = 60
+    # BM25 staleness guard (P1-4): the in-memory keyword index is rebuilt when the
+    # underlying Chroma collection count changes (e.g. after a re-ingest), so a
+    # long-running server never serves a stale keyword view. Set False to pin the
+    # index for the instance lifetime (lowest overhead, manual reload only).
+    bm25_auto_refresh: bool = True
+
+    # ── Formula / quantitative precision ────────────────────────────────────
+    # Exact-substring fast path: when a query carries math notation, inject
+    # chunks containing the verbatim symbol run at the top of the candidate pool.
+    enable_exact_formula_match: bool = True
+    # Feature boost: nudge has_formula / numeric-dense chunks up the ranking for
+    # numeric/formula queries (boosts ordering only, not the grounding score).
+    enable_feature_boost: bool = True
+    feature_boost_weight: float = 0.25
+    # Parent-section expansion: show the LLM the full parent section while keeping
+    # the precise child chunk for grounding/citation. Requires a re-ingest so
+    # chunks carry parent_id; OFF by default to keep current behaviour stable.
+    enable_parent_expansion: bool = False
+
+    # ── Cross-encoder rerank (optional, stronger than the bi-encoder re-sort) ──
+    # When enabled and a reranker endpoint is configured, the fused pool is
+    # re-scored by a cross-encoder; otherwise the bi-encoder cosine rerank is used.
+    # Falls back to the bi-encoder automatically if the endpoint is unreachable.
+    enable_cross_encoder_rerank: bool = False
+    reranker_base_url: str = ""        # e.g. http://localhost:8081  (POST /rerank)
+    reranker_model: str = ""
+    reranker_api_token: str = ""
 
     # ── History-aware retrieval & answer quality ────────────────────────────
     # Query contextualization: rewrite a follow-up ("what's its resolution?")
@@ -123,6 +177,18 @@ class Settings(BaseSettings):
     )
     extraction_temperature: float = 0.0
     extraction_max_tokens: int = 2048
+
+    # LLM generation settings for chat (shared by all get_llm() callers)
+    llm_temperature: float = 0.1
+    llm_max_tokens: int = 2048
+    # ── LLM resilience (P1-5) ───────────────────────────────────────────────
+    # Hard request timeout and bounded retries so a slow/hung Tabby endpoint can
+    # never stall a request thread indefinitely. A process-wide concurrency cap
+    # provides backpressure in front of the single shared LLM endpoint (chat +
+    # extraction + contextualization + summarization all share it).
+    llm_request_timeout: float = 60.0
+    llm_max_retries: int = 2
+    llm_max_concurrency: int = 8
     # Skip chunks longer than this many characters in a single LLM call (they are
     # already bounded by CHUNK_SIZE, but this guards against pathological inputs).
     extraction_max_chars: int = 6000
@@ -156,6 +222,25 @@ class Settings(BaseSettings):
     # The /api/embeddings path is appended automatically by OllamaEmbedder.
     ollama_base_url: str = "http://localhost:11434"
     ollama_embedding_model: str = "bge-large"
+    # ── Embedding throughput (P0-1) ─────────────────────────────────────────
+    # Native batch endpoint: Ollama's /api/embed accepts an array of inputs and
+    # returns all vectors in ONE round-trip. embed_documents() uses it to collapse
+    # N sequential HTTP calls (8 attack phrases, 20 rerank passages, …) into one.
+    # Falls back automatically to the legacy per-item /api/embeddings on any error
+    # (older Ollama builds), so this is safe to leave on.
+    ollama_use_native_batch: bool = True
+    ollama_embed_batch_path: str = "/api/embed"
+    ollama_embed_batch_size: int = 64          # split very large batches defensively
+    embed_timeout_seconds: int = 120
+    # Process-level LRU cache of QUERY embeddings. The same query is embedded
+    # several times per request (injection check, scope gate, vector search,
+    # passage rerank, graph rerank) — caching makes all but the first free.
+    # Set to 0 to disable. Document embeddings are never cached (unbounded text).
+    embed_query_cache_size: int = 512
+    # bge-style asymmetric retrieval: the QUERY is embedded with this instruction
+    # prefix while passages stay bare, which measurably improves recall. Applied
+    # only in embed_query. Set to "" to disable (e.g. for a symmetric model).
+    embed_query_instruction: str = "Represent this sentence for searching relevant passages: "
 
     # System prompt file path (change this to reconfigure LLM behaviour)
     system_prompt_path: str = "./prompts/system_prompt.txt"

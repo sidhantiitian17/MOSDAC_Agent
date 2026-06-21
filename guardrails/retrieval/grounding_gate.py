@@ -74,6 +74,17 @@ class CitationRegistry:
         return len(self._citations) > 0
 
 
+def _hit_relevance(hit) -> float:
+    """Normalized [0,1] relevance for a hit.
+
+    Prefers the explicit ``relevance`` field (a real cosine/cross-encoder score,
+    higher = better). Falls back to ``score`` when ``relevance`` is unset (0.0),
+    which keeps older callers and tests — that only populate ``score`` — working.
+    """
+    rel = getattr(hit, "relevance", 0.0) or 0.0
+    return float(rel) if rel else float(getattr(hit, "score", 0.0))
+
+
 def check_groundable(
     hits: list,
     min_score: float,
@@ -83,7 +94,8 @@ def check_groundable(
     Decide whether retrieved hits meet the relevance floor.
 
     Args:
-        hits:          VectorHit list from HybridRetriever (must have .score attribute).
+        hits:          VectorHit list from HybridRetriever. Uses ``.relevance``
+                       (normalized [0,1], higher=better) when present, else ``.score``.
         min_score:     Minimum acceptable relevance score (e.g. 0.20).
         min_passages:  Minimum number of passages above the floor.
 
@@ -94,8 +106,9 @@ def check_groundable(
         logger.info("Grounding gate: no hits returned")
         return False, 0.0
 
-    top_score = max(h.score for h in hits)
-    above_floor = [h for h in hits if h.score >= min_score]
+    scored = [(h, _hit_relevance(h)) for h in hits]
+    top_score = max(rel for _, rel in scored)
+    above_floor = [h for h, rel in scored if rel >= min_score]
 
     passes = len(above_floor) >= min_passages and top_score >= min_score
     logger.debug(
