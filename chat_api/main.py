@@ -217,6 +217,22 @@ def create_app(
     _setup_rate_limiter(app)
 
     app.include_router(build_router(service))
+
+    # Serve the embeddable widget assets (graph-rag-chat-widget.js + shim) so the
+    # repo's static/ folder is the single source of truth. Every Drupal site loads
+    # the SAME file through its nginx /static/ proxy — no per-site file copies, so
+    # a widget fix ships everywhere at once. Path is derived, not hardcoded.
+    import os
+
+    static_dir = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "static"
+    )
+    if os.path.isdir(static_dir):
+        from fastapi.staticfiles import StaticFiles
+
+        app.mount("/static", StaticFiles(directory=static_dir), name="static")
+        logger.info("Serving widget assets from %s at /static", static_dir)
+
     logger.info(
         "ChatAPI booted: title=%r origins=%s screenshot=%s auth=%s metrics=%s",
         chat_api_settings.title,
