@@ -90,8 +90,12 @@ def decode_token(token: str) -> dict:
     except HTTPException:
         raise
     except jwt.PyJWTError as exc:
+        # Log the specific cause server-side, but return a generic message (M5):
+        # the library detail (claim names, alg, validation specifics) is recon that
+        # aids token-forgery attempts and must not reach the client.
+        logger.info("JWT validation failed: %s", exc)
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED, detail=f"Invalid token: {exc}"
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token."
         ) from exc
     except Exception as exc:  # noqa: BLE001 — JWKS fetch/network failures
         logger.warning("Token verification failed: %s", exc)
@@ -101,28 +105,63 @@ def decode_token(token: str) -> dict:
         ) from exc
 
 
-def normalize_user_data(decoded_token: dict) -> dict:
-    """ADAPTER: extract id/username/email using the *configured* claim names.
+def lookup_claim(claims: dict, spec: str):
+    """Resolve a claim value from a decoded token using a configurable *spec*.
 
-    Decoupled from Keycloak's structure — a different IdP needs only an ``.env``
-    change. Raises ``HTTPException(401)`` naming the expected field when the id
-    claim is absent, so misconfiguration is diagnosable from the error message.
+    The spec (set in ``.env`` — e.g. ``JWT_FIELD_USERNAME``) is intentionally
+    expressive so that *custom token payloads need zero code changes*. It supports
+    the shapes real identity providers actually emit:
+
+    * a plain claim name ............... ``preferred_username``
+    * a dotted path into nested objects  ``user_info.preferred_username``
+    * comma-separated **fallbacks**, tried left-to-right until one is non-empty
+      ``preferred_username,name,email``
+
+    Returns the first non-empty value found, else ``None``. A plain single name
+    behaves exactly like ``claims.get(name)`` — fully backward compatible.
+    """
+    if not spec:
+        return None
+    for path in (p.strip() for p in spec.split(",")):
+        if not path:
+            continue
+        value = claims
+        for segment in path.split("."):
+            if isinstance(value, dict) and segment in value:
+                value = value[segment]
+            else:
+                value = None
+                break
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def normalize_user_data(decoded_token: dict) -> dict:
+    """ADAPTER: extract id/username/email using the *configured* claim specs.
+
+    Decoupled from Keycloak's structure — a different IdP (or a portal that issues
+    custom/nested claims) needs only an ``.env`` change. Each field spec supports
+    nested dotted paths and comma-separated fallbacks (see :func:`lookup_claim`).
+    Raises ``HTTPException(401)`` naming the expected field when the id claim is
+    absent, so misconfiguration is diagnosable from the error message.
     """
     s = chat_api_settings
-    uid = decoded_token.get(s.jwt_field_id)
+    uid = lookup_claim(decoded_token, s.jwt_field_id)
     if uid is None or uid == "":
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=(
                 f"Token is missing the required id claim '{s.jwt_field_id}'. "
                 f"Set JWT_FIELD_ID (or CHAT_API_JWT_FIELD_ID) to the claim your "
-                f"identity provider uses for the stable user id."
+                f"identity provider uses for the stable user id. A nested path "
+                f"(user_info.sub) or fallbacks (sub,uid) are allowed."
             ),
         )
     return {
         "id": str(uid),
-        "username": decoded_token.get(s.jwt_field_username),
-        "email": decoded_token.get(s.jwt_field_email),
+        "username": lookup_claim(decoded_token, s.jwt_field_username),
+        "email": lookup_claim(decoded_token, s.jwt_field_email),
     }
 
 

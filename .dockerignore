@@ -1,0 +1,57 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Docker build-context exclusions.
+#
+# `COPY . .` in Dockerfile.api ignores .gitignore — it ONLY honours this file.
+# Without it, secrets (.env), user PII (conversations.db) and hundreds of MB of
+# data/vector/graph dirs get baked into image layers (recoverable via
+# `docker history`). Everything below is either a secret, runtime state, or data
+# that is mounted as a volume at runtime — none of it belongs in the image.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Version control
+.git
+.gitignore
+.gitattributes
+
+# Secrets / environment (keep ONLY the template)
+.env
+.env.*
+!.env.example
+
+# Python virtual environments & caches
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+.python-version
+
+# Runtime state & user data (NEVER ship these in an image)
+conversations.db
+conversations.db-wal
+conversations.db-shm
+ingest_manifest.json
+drupal_ingestion_state.json
+
+# Large data / generated stores (mounted as volumes at runtime)
+chroma_db/
+neo4j_data/
+downloads/
+atlases_pdfs/
+eval_runs/
+eval_results.md
+models_cache/
+models--*/
+
+# Tests & docs are not needed in the runtime image
+tests/
+docs/
+*.md
+!README.md
+
+# IDE
+.vscode/
+.idea/
+.claude/

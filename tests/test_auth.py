@@ -66,6 +66,45 @@ def test_normalize_user_data_coerces_id_to_string(monkeypatch):
     assert out["username"] is None and out["email"] is None
 
 
+def test_normalize_user_data_nested_dotted_path(monkeypatch):
+    """A custom token nesting identity under an object resolves via a dotted spec."""
+    from chat_api import auth
+
+    _patch_settings(
+        monkeypatch,
+        jwt_field_id="user_info.sub",
+        jwt_field_username="user_info.preferred_username",
+        jwt_field_email="user_info.email",
+    )
+    token = {"user_info": {"sub": "nested-1", "preferred_username": "carol", "email": "c@x.org"}}
+    assert auth.normalize_user_data(token) == {
+        "id": "nested-1",
+        "username": "carol",
+        "email": "c@x.org",
+    }
+
+
+def test_normalize_user_data_fallback_claims(monkeypatch):
+    """Comma-separated fallbacks are tried left-to-right; first non-empty wins."""
+    from chat_api import auth
+
+    _patch_settings(
+        monkeypatch,
+        jwt_field_id="sub,uid",
+        jwt_field_username="preferred_username,name,email",
+    )
+    # preferred_username absent/empty → falls through to name.
+    out = auth.normalize_user_data({"uid": "u-7", "preferred_username": "", "name": "Dave"})
+    assert out["id"] == "u-7" and out["username"] == "Dave"
+
+
+def test_lookup_claim_returns_none_when_no_path_matches(monkeypatch):
+    from chat_api import auth
+
+    assert auth.lookup_claim({"a": {"b": "x"}}, "a.c,missing") is None
+    assert auth.lookup_claim({}, "") is None
+
+
 # ── decode_token (JWKS verification) ─────────────────────────────────────────
 
 class _FakeKey:

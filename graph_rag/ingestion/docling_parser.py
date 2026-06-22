@@ -49,6 +49,9 @@ def _build_converter(force_full_page_ocr: bool):
     )
 
     pipeline_options = PdfPipelineOptions()
+    # OFFLINE: load models from the pre-downloaded artifacts dir (no Hub calls).
+    if settings.docling_artifacts_path:
+        pipeline_options.artifacts_path = settings.docling_artifacts_path
     pipeline_options.do_ocr = True
     pipeline_options.ocr_options = ocr_options
     pipeline_options.do_table_structure = settings.docling_do_table_structure

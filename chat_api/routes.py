@@ -1,7 +1,9 @@
 """HTTP route definitions - depends only on the ChatService abstraction."""
 from __future__ import annotations
 
+import hmac
 import logging
+import uuid
 from typing import List, Optional
 
 from fastapi import (
@@ -42,23 +44,31 @@ def _require_api_key(
     provided = x_api_key
     if not provided and authorization and authorization.lower().startswith("bearer "):
         provided = authorization[7:].strip()
-    if provided != expected:
+    # Constant-time compare (M2): a plain != short-circuits on the first differing
+    # byte, leaking the token length / prefix via response timing.
+    if not hmac.compare_digest(provided or "", expected):
         raise HTTPException(status_code=401, detail="Invalid or missing API key.")
 
 
 def _require_admin(x_admin_token: str | None = Header(default=None)) -> None:
-    """Operator auth for /reload. Endpoint is disabled unless CHAT_API_ADMIN_TOKEN is set."""
+    """Operator auth for /reload + /metrics. Disabled unless CHAT_API_ADMIN_TOKEN is set."""
     expected = chat_api_settings.admin_token
     if not expected:
         raise HTTPException(status_code=404, detail="Not found.")
-    if x_admin_token != expected:
+    if not hmac.compare_digest(x_admin_token or "", expected):  # constant-time (M2)
         raise HTTPException(status_code=401, detail="Invalid admin token.")
 
 
-def build_router(service: ChatService) -> APIRouter:
+def build_router(service: ChatService, limiter=None) -> APIRouter:
     router = APIRouter()
 
+    def _maybe_exempt(fn):
+        """Exempt a route from the global per-IP rate limit (M7). No-op without a
+        limiter (e.g. dev with CHAT_API_REQUIRE_RATE_LIMIT=false)."""
+        return limiter.exempt(fn) if limiter is not None else fn
+
     @router.get("/health")
+    @_maybe_exempt
     def health():
         """Liveness — cheap, never touches downstream deps (P0-4)."""
         return {
@@ -70,6 +80,7 @@ def build_router(service: ChatService) -> APIRouter:
         }
 
     @router.get("/ready")
+    @_maybe_exempt
     def ready(response: Response):
         """Readiness — probes embedder / Chroma / Neo4j (P0-4). 503 when not ready
         so a load balancer stops routing to a replica with a dead dependency."""
@@ -82,15 +93,44 @@ def build_router(service: ChatService) -> APIRouter:
 
     @router.get("/config")
     def widget_config():
+        # Surface the backend's Keycloak coordinates so the standalone SSO harness
+        # (static/sso-demo.html) targets the SAME realm/host the backend verifies
+        # against — otherwise its built-in defaults can point at a non-existent realm
+        # and every login 401s. Production Drupal ignores these (token comes server-
+        # side); they are public OIDC discovery values, safe to expose unauthenticated.
+        kc_url, kc_realm = chat_api_settings.keycloak_url_and_realm()
         return {
             "title": chat_api_settings.title,
             "bot_name": chat_api_settings.bot_name,
             "screenshot_enabled": chat_api_settings.enable_screenshot,
             "max_screenshot_bytes": chat_api_settings.max_screenshot_bytes,
+            # Lets the widget decide whether to show a Sign-in affordance and where
+            # it should redirect — centrally configurable, no per-site edits.
+            "auth_enabled": chat_api_settings.auth_enabled,
+            "login_url": chat_api_settings.login_url,
+            "keycloak_issuer": chat_api_settings.keycloak_issuer,
+            "keycloak_url": kc_url,
+            "keycloak_realm": kc_realm,
+            "keycloak_client": chat_api_settings.keycloak_public_client,
         }
 
+    @router.get("/me")
+    def me(user: NormalizedUser = Depends(get_current_user)):
+        """Current user's profile for the widget greeting / personalization.
+
+        Reuses the same claim adapter as the conversation endpoints, so the
+        ``username`` honours ``JWT_FIELD_USERNAME`` — no client-side JWT parsing.
+        Returns 503 when auth is disabled and 401 when the token is missing/invalid
+        (both inherited from ``get_current_user``).
+        """
+        return {"id": user.id, "username": user.username, "email": user.email}
+
     if chat_api_settings.enable_metrics:
-        @router.get("/metrics")
+        # Guarded by the admin token (M3): metrics leak request volumes, refusal /
+        # abuse rates and latencies. With no CHAT_API_ADMIN_TOKEN set the endpoint
+        # 404s (Prometheus must scrape with X-Admin-Token). Exempt from the limiter.
+        @router.get("/metrics", dependencies=[Depends(_require_admin)])
+        @_maybe_exempt
         def metrics():
             from observability import CONTENT_TYPE, render_latest
 
@@ -208,8 +248,14 @@ def build_router(service: ChatService) -> APIRouter:
             raise HTTPException(status_code=404, detail="Conversation not found.")
         return {"deleted": conversation_id}
 
-    @router.delete("/chat/{session_id}")
+    @router.delete("/chat/{session_id}", dependencies=[Depends(_require_api_key)])
     def clear_session(session_id: str):
+        # Validate the id shape (M4) — a non-UUID can never be a real session key,
+        # and the endpoint is now behind the same caller auth as /chat.
+        try:
+            uuid.UUID(session_id)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="session_id must be a valid UUID.")
         service.clear_session(session_id)
         return {"cleared": session_id}
 

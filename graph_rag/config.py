@@ -18,7 +18,11 @@ class Settings(BaseSettings):
     # Neo4j
     neo4j_uri: str = "bolt://localhost:7687"
     neo4j_username: str = "neo4j"
-    neo4j_password: str = "neo4j_password"
+    # No baked-in password default (L5): when the graph runs with auth enabled this
+    # MUST come from NEO4J_PASSWORD in the environment. Empty is correct for the
+    # local NEO4J_AUTH=none dev container (the server ignores credentials there);
+    # a real deployment supplies a strong password via .env and enables auth (B2).
+    neo4j_password: str = ""
     neo4j_database: str = "neo4j"
     # Driver connection pool / timeout tuning (P2-4). Bounds resource use and
     # prevents indefinite hangs if Neo4j is slow or bouncing. All env-driven.
@@ -57,6 +61,13 @@ class Settings(BaseSettings):
     docling_max_file_mb: int = 250
     # Cap pages parsed per document (0 = no cap). Bounds worst-case memory/time.
     docling_max_pages: int = 0
+    # OFFLINE / AIR-GAPPED: directory holding pre-downloaded Docling models
+    # (layout, TableFormer, CodeFormula). When set, the converter loads models
+    # from this local path and makes NO HuggingFace Hub calls at parse time. The
+    # Docker image populates it at build (`docling-tools models download -o ...`)
+    # and exports DOCLING_ARTIFACTS_PATH, which maps to this field. Empty = let
+    # Docling fetch/cache from the Hub on first use (needs network).
+    docling_artifacts_path: str = ""
 
     # ── Universal multi-format ingestion ────────────────────────────────────
     # Kill-switches for whole format families (registry: graph_rag/ingestion/

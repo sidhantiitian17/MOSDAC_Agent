@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MOSDAC BOT — SSO demo / verification harness</title>
+  <!--
+    Local end-to-end test harness for the chat widget's Keycloak SSO flow.
+
+    This page stands in for the production Drupal portal: it runs the OIDC login
+    against the local Keycloak, then hands the access token to the widget via
+    getToken() and triggers login via loginUrl(). The WIDGET itself stays
+    portal-agnostic — it only knows "call getToken() for a token" and "call
+    loginUrl() / navigate to it to sign in".
+
+    Serve it from the API origin so /config, /me, /chat and /conversations are
+    same-origin (no CORS):  http://localhost:8000/static/sso-demo.html
+
+    Keycloak realm/client (override with ?realm=&client=&kc= query params):
+      KC base : http://localhost:8081
+      realm   : mosdac
+      client  : mosdac-chat   (public, Standard Flow, redirect http://localhost:8000/*)
+  -->
+  <style>
+    body { font: 15px/1.5 system-ui, sans-serif; margin: 0; padding: 40px; color: #16203a; }
+    .card { max-width: 640px; margin: 0 auto; }
+    code { background: #f1f3f8; padding: 1px 5px; border-radius: 4px; }
+    #status { padding: 10px 14px; border-radius: 10px; background: #f1f3f8; margin: 16px 0; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>MOSDAC BOT — SSO demo</h1>
+    <p>This page verifies the widget's Sign-in → Keycloak SSO → persisted history flow.
+       Open the chat launcher (bottom-right). While signed out you'll see the
+       <strong>Sign in</strong> card; after sign-in the greeting shows your username and the
+       <strong>Chat History</strong> sidebar persists.</p>
+    <div id="status">Initializing…</div>
+    <p><small>Auth state and token come from Keycloak via <code>keycloak-js</code>; the widget
+       reads them through <code>getToken()</code> / <code>loginUrl()</code>.</small></p>
+  </div>
+
+  <script>
+    // ── Config ───────────────────────────────────────────────────────────────
+    // Resolution order per field: ?query-param  >  backend GET /config  >  fallback.
+    // Pulling from /config makes this harness target the SAME realm/host the backend
+    // verifies tokens against, so it can't default to a non-existent realm (401 trap).
+    const qs     = new URLSearchParams(location.search);
+    let   KC_URL = qs.get('kc')     || '';
+    let   REALM  = qs.get('realm')  || '';
+    let   CLIENT = qs.get('client') || '';
+    const statusEl = document.getElementById('status');
+
+    function loadScript(src) {
+      return new Promise((resolve, reject) => {
+        const s = document.createElement('script');
+        s.src = src; s.async = false;
+        s.onload = resolve; s.onerror = () => reject(new Error('Failed to load ' + src));
+        document.head.appendChild(s);
+      });
+    }
+
+    function bootWidget(kc) {
+      // The widget boots from this config; getToken() always returns a fresh token.
+      window.KC_TOKEN = kc.token || '';
+      window.GRAPH_RAG_CHAT_CONFIG = {
+        apiBase:       '',                 // same-origin with the FastAPI server
+        botTitle:      'MOSDAC BOT',
+        logoUrl:       '/static/isro-logo.png',
+        greeting:      "Hey {name}, what's on your mind today?",
+        elementPrefix: 'mosdac',
+        getToken: async () => {
+          try { if (kc.authenticated) await kc.updateToken(30); } catch (e) {}
+          return kc.token || '';
+        },
+        // loginUrl as a function → the widget calls it; keycloak-js does the redirect.
+        loginUrl: () => kc.login({ redirectUri: location.href }),
+      };
+      loadScript('/static/graph-rag-chat-widget.js');
+    }
+
+    (async function () {
+      try {
+        // Fill any unset field from the backend's Keycloak coordinates (query wins).
+        try {
+          const cfg = await fetch('/config').then(r => r.ok ? r.json() : null);
+          if (cfg) {
+            KC_URL = KC_URL || cfg.keycloak_url    || '';
+            REALM  = REALM  || cfg.keycloak_realm  || '';
+            CLIENT = CLIENT || cfg.keycloak_client || '';
+          }
+        } catch (e) { /* /config unreachable — use fallbacks below */ }
+        // Last-resort fallbacks (only if neither query param nor backend supplied one).
+        KC_URL = KC_URL || 'http://localhost:8081';
+        REALM  = REALM  || 'master';
+        CLIENT = CLIENT || 'mosdac-chat';
+        statusEl.textContent = 'Keycloak ' + KC_URL + ' · realm=' + REALM + ' · client=' + CLIENT + ' — initializing…';
+
+        await loadScript(KC_URL + '/js/keycloak.js');
+        const kc = new Keycloak({ url: KC_URL, realm: REALM, clientId: CLIENT });
+        // No onLoad: anonymous by default. init() still processes the OAuth response
+        // in the URL when returning from login. Iframe session-check disabled to
+        // avoid cross-port cookie noise on localhost.
+        const authed = await kc.init({ pkceMethod: 'S256', checkLoginIframe: false });
+        kc.onTokenExpired = () => kc.updateToken(30).catch(() => {});
+        statusEl.textContent = authed
+          ? 'Signed in as: ' + (kc.tokenParsed.preferred_username || kc.subject)
+          : 'Not signed in — open the widget and click “Sign in”.';
+        bootWidget(kc);
+      } catch (err) {
+        statusEl.textContent = 'Keycloak init failed: ' + err.message +
+          ' — is Keycloak running at ' + KC_URL + ' and the realm/client created?';
+        console.error(err);
+      }
+    })();
+  </script>
+</body>
+</html>

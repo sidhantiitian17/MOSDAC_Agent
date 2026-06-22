@@ -11,6 +11,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1 \
     libglib2.0-0 \
     libgomp1 \
+    gosu \
     && rm -rf /var/lib/apt/lists/*
 
 # Tesseract data path (Debian slim) — used by TesseractCliOcrOptions.
@@ -23,13 +24,52 @@ RUN pip install --no-cache-dir -r requirement.txt \
     fastapi "uvicorn[standard]" \
  && python -m spacy download en_core_web_sm
 
+# ── Docling models: download EVERYTHING at build time (air-gapped readiness) ──
+# After the image is built there is NO internet. Docling otherwise fetches its
+# layout / TableFormer / CodeFormula models from HuggingFace on first parse — and
+# even with a warm cache it issues HEAD requests to revalidate, which hang with
+# no network. We pre-download the full predefined model set into a fixed path and
+# point Docling at it via DOCLING_ARTIFACTS_PATH (read by graph_rag config AND by
+# Docling itself), so parsing loads models straight off local disk — zero Hub calls.
+ENV HF_HOME=/app/.cache/huggingface
+ENV DOCLING_ARTIFACTS_PATH=/app/.cache/docling-models
+RUN docling-tools models download --output-dir /app/.cache/docling-models \
+ && test -n "$(ls -A /app/.cache/docling-models 2>/dev/null)" \
+ && python -c "from docling.document_converter import DocumentConverter; print('docling import OK')"
 
- ENV HF_HOME=/app/.cache/huggingface
-# Pre-download Docling models into the image (offline / air-gapped readiness).
-# Caches layout, TableFormer, and CodeFormula models so first parse needs no network.
-RUN docling-tools models download \
- && python -c "from docling.document_converter import DocumentConverter; print('docling OK')"
+# From here on, force fully-offline model resolution. Set AFTER the download above
+# so the download itself still has network. At runtime any stray transformers /
+# huggingface_hub lookup uses the local cache only and never touches the network.
+ENV HF_HUB_OFFLINE=1
+ENV TRANSFORMERS_OFFLINE=1
+ENV HF_HUB_DISABLE_TELEMETRY=1
 
 COPY . .
 
-CMD ["uvicorn", "chat_api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Build-time OFFLINE verification: construct the exact production Docling
+# converters with the network policy already set to offline. If a required model
+# were missing from the artifacts dir this FAILS THE BUILD here, rather than
+# surfacing as a runtime parse error in the field.
+RUN python -c "from graph_rag.preprocessing.preprocessor import _build_converter as a; a(); from graph_rag.ingestion.docling_parser import _build_converter as b; b(False); b(True); print('Docling converters built offline from artifacts_path OK')"
+
+# H3: the application runs as a non-root user. Any RCE in the (large) parsing/
+# LLM/OCR dependency tree then runs unprivileged. A dedicated writable dir holds
+# the SQLite conversation store (a named volume in compose so history survives
+# container recreation). We do NOT pin `USER appuser` here: the container starts
+# as root via docker-entrypoint.sh ONLY to chown the runtime mounts, then drops
+# to appuser with gosu before exec'ing uvicorn — so the app never runs as root.
+RUN useradd -m -u 10001 appuser \
+ && mkdir -p /app/data \
+ && chown -R appuser:appuser /app
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
+ENV CHAT_API_SQLITE_PATH=/app/data/conversations.db
+
+# Single uvicorn process per container (L4). Scale OUT with replicas, not workers:
+# multi-worker/replica needs the Redis session backend AND a shared conversation
+# store (CHAT_API_CONV_STORE=postgres) — see H4. We deliberately do NOT pass
+# --proxy-headers: the app derives the client IP itself, gated by
+# CHAT_API_TRUST_FORWARDED_FOR, so uvicorn must not rewrite request.client.
+ENTRYPOINT ["docker-entrypoint.sh"]
+CMD ["uvicorn", "chat_api.main:app", "--host", "0.0.0.0", "--port", "8000", "--timeout-keep-alive", "65"]

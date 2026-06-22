@@ -1,24 +1,54 @@
 <!-- ==========================================================================
-     MOSDAC BOT — embed snippet for a Drupal site.
+     MOSDAC BOT — embed snippet for a Drupal site (OpenID Connect module + Keycloak).
      Place before </body> in the Drupal theme (e.g. html.html.twig).
 
-     SSO: a logged-in user's Keycloak access token is exposed to the page by the
-     Drupal OIDC module (server-side) via the <meta> tag below. Anonymous pages
-     simply omit the meta tag — the widget then runs an ephemeral chat with no
-     history sidebar. Nothing here is hardcoded in the backend.
+     SSO token bridge: the Drupal "OpenID Connect" module performs the OIDC code
+     exchange server-to-server and stores the Keycloak access token in the user's
+     session. A theme preprocess hook re-exposes it to the page as the
+     `kc_access_token` variable, which we print into the <meta> tag below. This is
+     deliberately server-side: if Keycloak is HTTP while the site is HTTPS, the
+     browser cannot talk to Keycloak directly (mixed content), so client-side
+     keycloak-js is not an option here.
+
+     Add to <theme>.theme:
+       function THEME_preprocess_html(array &$variables) {
+         $variables['kc_access_token'] = '';
+         $a = \Drupal::currentUser();
+         if ($a->isAuthenticated() && \Drupal::hasService('openid_connect.session')) {
+           $t = \Drupal::service('openid_connect.session')->retrieveAccessToken();
+           if (!empty($t)) { $variables['kc_access_token'] = $t; }
+         }
+         $variables['#cache']['contexts'][] = 'user';   // never share across users
+         $variables['#cache']['max-age'] = 0;
+       }
+
+     Anonymous pages omit the meta tag → the widget runs an ephemeral chat with no
+     history sidebar and shows the Sign-in card. Nothing is hardcoded in the backend.
+
+     NOTE: Keycloak access tokens are short-lived (realm "Access Token Lifespan",
+     default 60s). The bridged token is the one stored at login and is NOT refreshed
+     per page load, so set a generous lifespan (e.g. 1h) for the SSO session, or the
+     widget will fall back to the Sign-in card once it expires.
      ========================================================================== -->
 
-<!-- Rendered server-side ONLY for authenticated users (empty/absent otherwise) -->
-<meta name="kc-token" content="{{ keycloak_access_token }}">
+<!-- Rendered server-side ONLY for authenticated users (omitted otherwise) -->
+{% if kc_access_token %}
+<meta name="kc-token" content="{{ kc_access_token }}">
+{% endif %}
 
 <script>
   window.GRAPH_RAG_CHAT_CONFIG = {
     apiBase:  '/chatapi',                          // nginx → FastAPI (change per site)
     botTitle: 'MOSDAC BOT',
     logoUrl:  '/static/isro-logo.png',             // ISRO logo
-    greeting: "Hey User, what's on your mind today?",
+    greeting: "Hey {name}, what's on your mind today?",  // {name} → username after sign-in
     suggestions: ['How can you help me browse?', 'What can you do?', 'Explain a topic'],
     elementPrefix: 'mosdac',
+    // "Sign in" sends anonymous users to the Drupal OpenID Connect login page
+    // (portal-wide Keycloak SSO). After login the token reaches the page via the
+    // <meta name="kc-token"> bridge above. The backend may override this centrally
+    // via GET /config (CHAT_API_LOGIN_URL).
+    loginUrl: '/user/login/openid_connect',
     // getToken is provided by the shim below (reads window.KC_TOKEN / meta tag);
     // override here only if your portal exposes the token differently.
   };

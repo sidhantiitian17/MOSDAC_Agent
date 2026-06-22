@@ -139,6 +139,9 @@ def _build_converter():
     ocr_options = TesseractCliOcrOptions(lang=[settings.docling_ocr_lang])
 
     pdf_opts = PdfPipelineOptions()
+    # OFFLINE: load models from the pre-downloaded artifacts dir (no Hub calls).
+    if settings.docling_artifacts_path:
+        pdf_opts.artifacts_path = settings.docling_artifacts_path
     pdf_opts.do_ocr = True
     pdf_opts.ocr_options = ocr_options
     pdf_opts.do_table_structure = settings.docling_do_table_structure

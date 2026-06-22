@@ -1,90 +1,96 @@
-# Core LangChain
-langchain>=0.3
-langchain-community>=0.3
-langchain-core>=0.3
-langchain-openai>=0.2
-langchain-text-splitters>=0.3
-langchain-chroma>=0.1
-langchain-neo4j>=0.1
+# Pip install set for the Docker build. Mirrors [project.dependencies] in
+# pyproject.toml (B3 — single, consistent dependency graph). Every constraint has
+# an UPPER BOUND so a transitive major bump can't silently break production.
+
+# Core LangChain — pinned to the 0.3 line. Do NOT raise to >=0.4/1.x: it breaks
+# langchain-chroma / langchain-neo4j (0.3-era integrations).
+langchain>=0.3,<0.4
+langchain-community>=0.3,<0.4
+langchain-core>=0.3,<0.4
+langchain-openai>=0.2,<0.4
+langchain-text-splitters>=0.3,<0.4
+langchain-chroma>=0.1,<0.3
+langchain-neo4j>=0.1,<0.6
 
 # LLM SDKs
-openai>=1.0
+openai>=1.0,<2
 
 # Embeddings are served over HTTP — bge-large via Ollama (/api/embeddings) or
 # Nomic Embed Text via Tabby ML (/v1/embeddings). No local model weights are
 # loaded in-process, so torch / sentence-transformers are not required.
 
 # Vector DB
-chromadb>=0.5
+chromadb>=0.5,<2
 
 # Graph DB
-neo4j>=5.0
+neo4j>=5.0,<6
 
 # Document loaders
-pypdf>=4.0
-pymupdf>=1.24
-pytesseract>=0.3
-pdf2image>=1.17
-Pillow>=10.0
-beautifulsoup4>=4.12
-lxml>=5.0
-unstructured>=0.14
+pypdf>=4.0,<6
+pymupdf>=1.24,<2
+pytesseract>=0.3,<0.4
+pdf2image>=1.17,<2
+Pillow>=10.0,<12
+beautifulsoup4>=4.12,<5
+lxml>=5.0,<6
+unstructured>=0.14,<0.24
 
 # ── Docling — primary structured PDF parser (Markdown + LaTeX math + OCR) ──────
 # Brings docling-core, docling-parse, docling-ibm-models, and a CPU onnxruntime.
 # OCR uses the system Tesseract installed in Dockerfile.api (no bundled engine).
-docling>=2.15
+docling>=2.15,<3
 
 # NLP — entity & relationship extraction
-spacy>=3.7
+spacy>=3.7,<4
 # After install: python -m spacy download en_core_web_sm
 
 # Web framework (FastAPI gateway)
-fastapi>=0.100
-uvicorn[standard]>=0.23
+fastapi>=0.100,<1
+uvicorn[standard]>=0.23,<1
 
 # SSO / Keycloak — JWT verification against the realm's JWKS public keys.
 # The [crypto] extra brings the RS256 signing-key support PyJWKClient needs.
 # Only loaded when CHAT_API_AUTH_ENABLED=true (imported lazily in chat_api/auth.py).
-PyJWT[crypto]>=2.8
-# Per-user conversation history is stored in SQLite via the stdlib `sqlite3`
-# module — no extra dependency required.
+PyJWT[crypto]>=2.8,<3
+# Per-user conversation history: SQLite via stdlib (no dep) for a single replica;
+# PostgreSQL (psycopg, below) for a shared multi-replica store.
 
 # Hybrid search — BM25 keyword ranking (Reciprocal Rank Fusion with vector search)
-rank-bm25>=0.2.2
+rank-bm25>=0.2.2,<0.3
 
 # Utilities
-python-dotenv
-pydantic>=2.0
-pydantic-settings>=2.0
-tqdm
-typer>=0.12
-requests>=2.31
+python-dotenv>=1.0,<2
+pydantic>=2.0,<3
+pydantic-settings>=2.0,<3
+tqdm>=4.0,<5
+typer>=0.12,<1
+requests>=2.31,<3
 
 # ── Evaluation (RAGAS production gate — see evaluation_plan.md) ────────────────
-# RAGAS provides the LLM-judged retrieval/generation metrics (faithfulness,
-# context precision/recall, entity recall, noise sensitivity, factual correctness,
-# response relevancy, semantic similarity). `datasets` backs ragas' EvaluationDataset.
-# The judge LLM + embeddings are wired through langchain (already present) so the
-# judge can be a stronger model than the local generator under test.
 # Pinned to the 0.2 line: ragas 0.2.x targets the langchain 0.3 stack this project
-# uses. Do NOT unpin to >=0.4 — that drags langchain up to 1.x and breaks
+# uses. Do NOT unpin to >=0.3 — that drags langchain up to 1.x and breaks
 # langchain-chroma / langchain-neo4j (which are 0.3-era here).
 ragas>=0.2,<0.3
 datasets>=2.0,<4
 
 # Testing
-pytest>=8.0
-pytest-mock>=3.12
-httpx>=0.27          # required by fastapi.testclient
+pytest>=8.0,<9
+pytest-mock>=3.12,<4
+httpx>=0.27,<1          # required by fastapi.testclient
 
-# Rate limiting (required — SlowAPIMiddleware enforces per-IP limits on /chat)
-slowapi>=0.1.9
+# Rate limiting (required — SlowAPIMiddleware enforces per-IP limits, and the app
+# fails closed at startup without it unless CHAT_API_REQUIRE_RATE_LIMIT=false).
+slowapi>=0.1.9,<0.2
 
 # Observability — Prometheus /metrics. Optional: observability/metrics.py degrades
 # to an in-process fallback if this is absent, but install it in production.
-prometheus-client>=0.20
+prometheus-client>=0.20,<1
 
 # Optional — pluggable session backend. REQUIRED for multi-replica / persistent
 # sessions (CHAT_API_SESSION_BACKEND=redis). See production.md.
-redis>=5.0
+redis>=5.0,<7
+
+# Optional — shared conversation store for multi-replica deployments (H4).
+# REQUIRED when CHAT_API_CONV_STORE=postgres. Lazy-imported, so single-replica
+# SQLite deployments do not need it installed.
+psycopg[binary,pool]>=3.1,<4

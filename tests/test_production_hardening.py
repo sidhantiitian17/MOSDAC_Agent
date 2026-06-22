@@ -103,6 +103,65 @@ def test_require_persistent_sessions_refuses_memory(monkeypatch):
         session_mod.build_session_store()
 
 
+def test_conv_store_sqlite_refused_for_multi_replica(monkeypatch):
+    """H4: local SQLite history is unsafe with the multi-replica signal — the
+    factory must refuse it and point the operator at the postgres backend."""
+    from chat_api import db as db_mod
+    from chat_api.config import ChatAPISettings
+
+    monkeypatch.setattr(
+        db_mod, "chat_api_settings",
+        ChatAPISettings(_env_file=None, conv_store="sqlite", require_persistent_sessions=True),
+        raising=False,
+    )
+    with pytest.raises(RuntimeError, match="postgres"):
+        db_mod.build_conversation_repository()
+
+
+def test_conv_store_postgres_requires_dsn(monkeypatch):
+    from chat_api import db as db_mod
+    from chat_api.config import ChatAPISettings
+
+    monkeypatch.setattr(
+        db_mod, "chat_api_settings",
+        ChatAPISettings(_env_file=None, conv_store="postgres", postgres_dsn=""),
+        raising=False,
+    )
+    with pytest.raises(RuntimeError, match="POSTGRES_DSN"):
+        db_mod.build_conversation_repository()
+
+
+def test_rate_limiter_fails_closed_when_slowapi_missing(monkeypatch):
+    """H2: if the limiter can't be attached and CHAT_API_REQUIRE_RATE_LIMIT is set,
+    startup RAISES rather than serving a public endpoint with no abuse control."""
+    import sys
+
+    from fastapi import FastAPI
+
+    from chat_api import main as main_mod
+    from chat_api.config import chat_api_settings
+
+    monkeypatch.setitem(sys.modules, "slowapi", None)  # force ImportError on import
+    monkeypatch.setattr(chat_api_settings, "require_rate_limit", True, raising=False)
+    with pytest.raises(RuntimeError, match="RATE_LIMIT"):
+        main_mod._setup_rate_limiter(FastAPI())
+
+
+def test_rate_limiter_soft_disable_when_not_required(monkeypatch):
+    """With CHAT_API_REQUIRE_RATE_LIMIT=false (dev), a missing limiter degrades to
+    no-op instead of crashing."""
+    import sys
+
+    from fastapi import FastAPI
+
+    from chat_api import main as main_mod
+    from chat_api.config import chat_api_settings
+
+    monkeypatch.setitem(sys.modules, "slowapi", None)
+    monkeypatch.setattr(chat_api_settings, "require_rate_limit", False, raising=False)
+    assert main_mod._setup_rate_limiter(FastAPI()) is None
+
+
 # ── P0-3: image path grounding gate ───────────────────────────────────────────
 
 def _service_with_hits(hits):
@@ -118,7 +177,16 @@ def _service_with_hits(hits):
     return ChatService(retriever=retriever, chain=MagicMock(), llm=llm, sessions=InMemorySessionStore())
 
 
-def test_image_path_refuses_when_not_groundable():
+def _enable_vision(monkeypatch):
+    """Configure a vision model so the image path is not refused by the M6 gate."""
+    from chat_api import service as service_mod
+
+    monkeypatch.setattr(service_mod.chat_api_settings, "enable_screenshot", True, raising=False)
+    monkeypatch.setattr(service_mod.chat_api_settings, "vision_model", "test-vlm", raising=False)
+
+
+def test_image_path_refuses_when_not_groundable(monkeypatch):
+    _enable_vision(monkeypatch)
     service = _service_with_hits([])  # empty hits → grounding gate fails
     b64 = base64.b64encode(b"img").decode()
     answer, _cits, grounded, refused = service.chat(
@@ -129,7 +197,8 @@ def test_image_path_refuses_when_not_groundable():
     service._llm.invoke.assert_not_called()  # never spent the vision LLM call
 
 
-def test_image_path_answers_when_groundable():
+def test_image_path_answers_when_groundable(monkeypatch):
+    _enable_vision(monkeypatch)
     service = _service_with_hits([VectorHit(text="MOSDAC passage", source="s.pdf", score=0.9, chunk_id="c1")])
     b64 = base64.b64encode(b"img").decode()
     answer, _cits, grounded, refused = service.chat(
@@ -137,6 +206,22 @@ def test_image_path_answers_when_groundable():
         message="What is shown here?", screenshot_b64=b64,
     )
     assert grounded and not refused and answer == "image-answer"
+
+
+def test_image_path_refused_without_vision_model(monkeypatch):
+    """M6: with no vision model configured, a screenshot upload is rejected with a
+    clear error (never silently sent to a text-only model)."""
+    from chat_api import service as service_mod
+
+    monkeypatch.setattr(service_mod.chat_api_settings, "enable_screenshot", True, raising=False)
+    monkeypatch.setattr(service_mod.chat_api_settings, "vision_model", "", raising=False)
+    service = _service_with_hits([VectorHit(text="x", source="s.pdf", score=0.9, chunk_id="c1")])
+    b64 = base64.b64encode(b"img").decode()
+    with pytest.raises(ValueError, match="vision model"):
+        service.chat(
+            session_id="00000000-0000-0000-0000-0000000000ac",
+            message="What is shown here?", screenshot_b64=b64,
+        )
 
 
 # ── P0-5: degraded guardrails are observable / fail-closed when required ───────
@@ -248,10 +333,23 @@ def test_ready_endpoint_reports_checks(monkeypatch):
     assert "ready" in body and "checks" in body
 
 
-def test_metrics_endpoint_exposed(monkeypatch):
-    client = _client(monkeypatch, enable_metrics=True)
+def test_metrics_hidden_without_admin_token(monkeypatch):
+    """M3: with no admin token configured, /metrics is hidden (404) — same posture
+    as /reload, so the endpoint cannot leak metrics on an unconfigured deployment."""
+    client = _client(monkeypatch, enable_metrics=True, admin_token="")
+    assert client.get("/metrics").status_code == 404
+
+
+def test_metrics_requires_admin_token(monkeypatch):
+    """M3: when an admin token is set, /metrics needs the correct X-Admin-Token."""
+    client = _client(monkeypatch, enable_metrics=True, admin_token="adm")
     client.post("/chat", json={"session_id": "00000000-0000-0000-0000-0000000000c1", "message": "hello there"})
-    r = client.get("/metrics")
+
+    # Missing / wrong token → unauthorized.
+    assert client.get("/metrics").status_code == 401
+    assert client.get("/metrics", headers={"X-Admin-Token": "nope"}).status_code == 401
+    # Correct token → exposition.
+    r = client.get("/metrics", headers={"X-Admin-Token": "adm"})
     assert r.status_code == 200
     assert "chat_requests_total" in r.text
 
@@ -337,3 +435,94 @@ def test_answer_cache_serves_repeat_without_chain(monkeypatch):
     service.chat("00000000-0000-0000-0000-0000000000c7", "What is INSAT?")  # same Q, fresh session/history
     # Second identical question (empty history) served from cache → chain invoked once.
     assert chain.invoke.call_count == 1
+
+
+# ── Offline-safe API docs (self-hosted Swagger UI) + favicon + scoped CSP ─────
+
+def test_docs_are_self_hosted_and_offline(monkeypatch):
+    """/docs must render from vendored, same-origin assets — no public CDN."""
+    client = _client(monkeypatch)
+    r = client.get("/docs")
+    assert r.status_code == 200
+    body = r.text
+    # Loads the local, vendored Swagger bundle/CSS/favicon (works air-gapped)…
+    assert "/static/vendor/swagger/swagger-ui-bundle.js" in body
+    assert "/static/vendor/swagger/swagger-ui.css" in body
+    assert "/static/vendor/favicon.png" in body
+    # …and never reaches out to a CDN that the CSP blocks / air-gap can't fetch.
+    assert "cdn.jsdelivr.net" not in body
+    assert "fastapi.tiangolo.com" not in body
+    # The vendored assets are actually served.
+    assert client.get("/static/vendor/swagger/swagger-ui-bundle.js").status_code == 200
+    assert client.get("/static/vendor/swagger/swagger-ui.css").status_code == 200
+
+
+def test_favicon_served_locally(monkeypatch):
+    client = _client(monkeypatch)
+    r = client.get("/favicon.ico")
+    assert r.status_code == 200
+    assert r.headers.get("content-type", "").startswith("image/")
+
+
+def test_csp_relaxed_only_on_docs_not_on_api(monkeypatch):
+    """Swagger UI needs an inline bootstrap script, so /docs gets 'unsafe-inline'
+    in script-src — but every other route keeps the strict policy."""
+    client = _client(monkeypatch)
+    docs_csp = client.get("/docs").headers.get("content-security-policy", "")
+    assert "script-src 'self' 'unsafe-inline'" in docs_csp
+    assert "frame-ancestors 'none'" in docs_csp  # still locked down against framing
+
+    api_csp = client.get("/health").headers.get("content-security-policy", "")
+    assert "script-src 'self';" in api_csp        # strict: no inline scripts on the API
+    assert "'unsafe-inline'" not in api_csp.split("style-src")[0]  # not in script-src
+    assert "frame-ancestors 'none'" in api_csp
+
+
+def test_default_cdn_docs_are_disabled(monkeypatch):
+    """The built-in CDN-backed docs/redoc are off (they'd be blank offline)."""
+    client = _client(monkeypatch)
+    # /redoc is disabled outright; /docs is our self-hosted replacement.
+    assert client.get("/redoc").status_code == 404
+
+
+# ── Docling offline: artifacts_path wiring (no HuggingFace Hub calls at parse) ─
+
+def test_docling_artifacts_path_wired_into_pipeline(monkeypatch):
+    """When docling_artifacts_path is set, the constructed converter's PDF pipeline
+    must carry it so Docling loads models from local disk — not the HuggingFace Hub.
+
+    Converter construction is lazy in Docling (no model weights load here), so this
+    is a cheap, network-free check of the offline wiring."""
+    pytest.importorskip("docling")
+    from docling.datamodel.base_models import InputFormat
+
+    from graph_rag.config import settings as gsettings
+    import graph_rag.ingestion.docling_parser as dp
+
+    monkeypatch.setattr(gsettings, "docling_artifacts_path", "/opt/docling-models")
+    dp._build_converter.cache_clear()
+    try:
+        conv = dp._build_converter(False)
+        pdf_opts = conv.format_to_options[InputFormat.PDF].pipeline_options
+        assert str(pdf_opts.artifacts_path) == "/opt/docling-models"
+    finally:
+        dp._build_converter.cache_clear()
+
+
+def test_docling_artifacts_path_unset_leaves_default(monkeypatch):
+    """With no artifacts dir configured, the pipeline keeps Docling's default
+    (None) — i.e. Hub-managed cache — so behaviour is unchanged off the air-gap."""
+    pytest.importorskip("docling")
+    from docling.datamodel.base_models import InputFormat
+
+    from graph_rag.config import settings as gsettings
+    import graph_rag.ingestion.docling_parser as dp
+
+    monkeypatch.setattr(gsettings, "docling_artifacts_path", "")
+    dp._build_converter.cache_clear()
+    try:
+        conv = dp._build_converter(False)
+        pdf_opts = conv.format_to_options[InputFormat.PDF].pipeline_options
+        assert pdf_opts.artifacts_path is None
+    finally:
+        dp._build_converter.cache_clear()

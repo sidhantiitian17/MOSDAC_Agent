@@ -26,10 +26,12 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import uuid
+from contextvars import ContextVar
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import FileResponse, PlainTextResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from chat_api.config import chat_api_settings
@@ -38,11 +40,59 @@ from chat_api.routes import build_router
 from chat_api.service import ChatService
 from chat_api.session import build_session_store
 
-logging.basicConfig(level=logging.INFO)
+# ── Request-ID correlation (L3) ───────────────────────────────────────────────
+# Stamped per request and injected into every log record so a single line in
+# prod can be traced across the request lifecycle.
+_request_id_ctx: ContextVar[str] = ContextVar("request_id", default="-")
+
+
+class _RequestIDLogFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.request_id = _request_id_ctx.get()
+        return True
+
+
+def _configure_logging() -> None:
+    handler = logging.StreamHandler()
+    handler.setFormatter(
+        logging.Formatter(
+            "%(asctime)s %(levelname)s %(name)s [%(request_id)s] | %(message)s"
+        )
+    )
+    handler.addFilter(_RequestIDLogFilter())
+    root = logging.getLogger()
+    # Idempotent: replace handlers so repeated create_app() calls (tests) don't stack.
+    root.handlers = [handler]
+    root.setLevel(logging.INFO)
+
+
+_configure_logging()
 logger = logging.getLogger("chat_api")
 
 
 # ── Security headers middleware ───────────────────────────────────────────────
+
+# Swagger UI bootstraps itself from an inline <script> and injects inline styles,
+# so the strict app CSP (script-src 'self') blanks the page. These paths get a
+# docs-scoped CSP that allows 'unsafe-inline' for the SAME-ORIGIN, self-hosted
+# Swagger bundle only — every other route keeps the strict policy below.
+_DOCS_PATHS = frozenset({"/docs", "/docs/oauth2-redirect", "/redoc"})
+
+_STRICT_CSP = (
+    "default-src 'self'; "
+    "script-src 'self'; "
+    "style-src 'self' 'unsafe-inline'; "
+    "img-src 'self' data:; "
+    "frame-ancestors 'none';"
+)
+_DOCS_CSP = (
+    "default-src 'self'; "
+    "script-src 'self' 'unsafe-inline'; "
+    "style-src 'self' 'unsafe-inline'; "
+    "img-src 'self' data:; "
+    "frame-ancestors 'none';"
+)
+
 
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     """Adds OWASP-recommended security headers to every response."""
@@ -54,11 +104,7 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         response.headers["Referrer-Policy"] = "no-referrer"
         response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
         response.headers["Content-Security-Policy"] = (
-            "default-src 'self'; "
-            "script-src 'self'; "
-            "style-src 'self' 'unsafe-inline'; "
-            "img-src 'self' data:; "
-            "frame-ancestors 'none';"
+            _DOCS_CSP if request.url.path in _DOCS_PATHS else _STRICT_CSP
         )
         # Only set HSTS on HTTPS (header is ignored over HTTP)
         if request.url.scheme == "https":
@@ -66,41 +112,124 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         return response
 
 
-# ── Body-size cap middleware (P1-2) ───────────────────────────────────────────
+# ── Request-ID middleware (L3) ────────────────────────────────────────────────
 
-class BodySizeLimitMiddleware(BaseHTTPMiddleware):
-    """Reject oversized requests on Content-Length BEFORE the body is read."""
-
-    def __init__(self, app, max_bytes: int) -> None:
-        super().__init__(app)
-        self._max = max_bytes
+class RequestIDMiddleware(BaseHTTPMiddleware):
+    """Attach an X-Request-ID to every request/response and the log context."""
 
     async def dispatch(self, request: Request, call_next):
-        if self._max:
-            cl = request.headers.get("content-length")
-            if cl:
-                try:
-                    if int(cl) > self._max:
-                        return PlainTextResponse("Request body too large.", status_code=413)
-                except ValueError:
-                    pass
-        return await call_next(request)
+        rid = request.headers.get("x-request-id") or uuid.uuid4().hex
+        token = _request_id_ctx.set(rid)
+        try:
+            response = await call_next(request)
+        finally:
+            _request_id_ctx.reset(token)
+        response.headers["X-Request-ID"] = rid
+        return response
+
+
+# ── Body-size cap middleware (P1-2 / L2) ──────────────────────────────────────
+
+class BodySizeLimitMiddleware:
+    """Pure-ASGI request body cap.
+
+    Two layers (L2): a fast reject on a declared ``Content-Length`` over the cap,
+    AND an enforced cap on the bytes actually streamed — so a chunked request that
+    omits ``Content-Length`` cannot bypass the limit. The body is buffered up to
+    the cap (bounded memory) and replayed to the app; oversize bodies get a 413
+    before the application ever sees them.
+    """
+
+    def __init__(self, app, max_bytes: int) -> None:
+        self.app = app
+        self._max = max_bytes
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or not self._max:
+            await self.app(scope, receive, send)
+            return
+
+        headers = dict(scope.get("headers") or [])
+        cl = headers.get(b"content-length")
+        if cl:
+            try:
+                if int(cl) > self._max:
+                    await self._reject_http(scope, send)
+                    return
+            except ValueError:
+                pass
+
+        # Buffer the body up to the cap; reject if exceeded (covers no-CL/chunked).
+        body = bytearray()
+        trailing = []
+        more = True
+        while more:
+            message = await receive()
+            if message["type"] != "http.request":
+                trailing.append(message)
+                break
+            body += message.get("body", b"")
+            if len(body) > self._max:
+                await self._reject_http(scope, send)
+                return
+            more = message.get("more_body", False)
+
+        replayed = False
+
+        async def replay():
+            nonlocal replayed
+            if not replayed:
+                replayed = True
+                return {"type": "http.request", "body": bytes(body), "more_body": False}
+            if trailing:
+                return trailing.pop(0)
+            return await receive()
+
+        await self.app(scope, replay, send)
+
+    @staticmethod
+    async def _reject_http(scope, send) -> None:
+        resp = PlainTextResponse("Request body too large.", status_code=413)
+        await resp(scope, _no_receive, send)
+
+
+async def _no_receive():  # pragma: no cover - a sent response never reads the body
+    return {"type": "http.request", "body": b"", "more_body": False}
 
 
 # ── Rate limiting (slowapi) ───────────────────────────────────────────────────
 
 def _client_ip_key(request: Request) -> str:
-    """Real client IP for rate limiting. Honours X-Forwarded-For only when the
-    deployment declares the proxy trusted (P1-1), else uses the socket peer."""
+    """Real client IP for rate limiting.
+
+    When the deployment declares the proxy trusted (P1-1 / H1) we read the IP the
+    *trusted proxy* stamped — NOT a client-supplied value. nginx sets
+    ``X-Real-IP $remote_addr`` (a single, overwritten value), so we prefer that;
+    failing that we take the RIGHT-MOST ``X-Forwarded-For`` hop, which is the one
+    appended by the proxy (``$proxy_add_x_forwarded_for``). Taking the left-most
+    entry would let a client forge its own rate-limit key by sending its own XFF.
+    With trust disabled we use the socket peer.
+    """
     if chat_api_settings.trust_forwarded_for:
+        real_ip = request.headers.get("x-real-ip")
+        if real_ip and real_ip.strip():
+            return real_ip.strip()
         xff = request.headers.get("x-forwarded-for")
         if xff:
-            return xff.split(",")[0].strip()
+            hops = [h.strip() for h in xff.split(",") if h.strip()]
+            if hops:
+                return hops[-1]  # right-most = appended by the trusted proxy
     return request.client.host if request.client else "anonymous"
 
 
-def _setup_rate_limiter(app: FastAPI) -> None:
-    """Attach slowapi rate limiter if the package is installed."""
+def _setup_rate_limiter(app: FastAPI):
+    """Attach the slowapi rate limiter and return it (or None).
+
+    Fails CLOSED (H2): if the limiter cannot be attached — typically because
+    ``slowapi`` is missing — and ``CHAT_API_REQUIRE_RATE_LIMIT`` is set (default),
+    startup RAISES rather than silently serving a public endpoint with no
+    abuse/DoS control. Returning the limiter lets the router exempt health probes.
+    """
     try:
         from slowapi import Limiter, _rate_limit_exceeded_handler  # type: ignore
         from slowapi.errors import RateLimitExceeded  # type: ignore
@@ -117,11 +246,19 @@ def _setup_rate_limiter(app: FastAPI) -> None:
             "Rate limiter enabled: %s per IP (trust_xff=%s)",
             rate, chat_api_settings.trust_forwarded_for,
         )
-    except ImportError:
+        return limiter
+    except Exception as exc:  # noqa: BLE001 — import or wiring failure
+        if chat_api_settings.require_rate_limit:
+            raise RuntimeError(
+                "Rate limiting could not be enabled but CHAT_API_REQUIRE_RATE_LIMIT "
+                "is true. Install slowapi (`pip install slowapi`) or, for local dev "
+                f"only, set CHAT_API_REQUIRE_RATE_LIMIT=false. Cause: {exc}"
+            ) from exc
         logger.warning(
-            "slowapi not installed — rate limiting disabled. "
-            "Run: pip install slowapi"
+            "Rate limiting DISABLED (slowapi unavailable: %s). "
+            "This is unsafe for a public deployment.", exc,
         )
+        return None
 
 
 # ── Lifespan: warm caches on startup, release drivers on shutdown ─────────────
@@ -198,9 +335,15 @@ def create_app(
         title=chat_api_settings.title,
         version=chat_api_settings.version,
         lifespan=_make_lifespan(retriever, getattr(service, "_repo", None)),
+        # Disable the built-in docs: they pull Swagger UI / ReDoc from a public CDN,
+        # which is blocked by our CSP and unreachable in an air-gapped deployment.
+        # We re-mount Swagger UI below from self-hosted, vendored assets.
+        docs_url=None,
+        redoc_url=None,
     )
 
-    # L0: Security headers + body-size cap
+    # L0: Request-ID correlation + security headers + body-size cap
+    app.add_middleware(RequestIDMiddleware)
     app.add_middleware(SecurityHeadersMiddleware)
     app.add_middleware(BodySizeLimitMiddleware, max_bytes=chat_api_settings.max_request_bytes)
 
@@ -213,10 +356,12 @@ def create_app(
         allow_credentials=True,
     )
 
-    # L0: Rate limiting
-    _setup_rate_limiter(app)
+    # L0: Rate limiting (fails closed unless CHAT_API_REQUIRE_RATE_LIMIT=false).
+    limiter = _setup_rate_limiter(app)
 
-    app.include_router(build_router(service))
+    # Health/readiness/metrics probes are exempted from the per-IP budget (M7) so
+    # frequent LB/orchestrator polling never trips the limiter and flaps readiness.
+    app.include_router(build_router(service, limiter=limiter))
 
     # Serve the embeddable widget assets (graph-rag-chat-widget.js + shim) so the
     # repo's static/ folder is the single source of truth. Every Drupal site loads
@@ -232,6 +377,41 @@ def create_app(
 
         app.mount("/static", StaticFiles(directory=static_dir), name="static")
         logger.info("Serving widget assets from %s at /static", static_dir)
+
+        # Self-hosted, offline-safe API docs. The Swagger UI bundle + CSS and the
+        # favicon are vendored under static/vendor/ so /docs renders with NO public
+        # CDN and NO outbound network — required for the air-gapped deployment and
+        # consistent with the CSP. Only wired when the vendored assets are present.
+        _swagger_js = os.path.join(static_dir, "vendor", "swagger", "swagger-ui-bundle.js")
+        _favicon = os.path.join(static_dir, "vendor", "favicon.png")
+        if os.path.isfile(_swagger_js):
+            from fastapi.openapi.docs import (
+                get_swagger_ui_html,
+                get_swagger_ui_oauth2_redirect_html,
+            )
+
+            @app.get("/docs", include_in_schema=False)
+            async def custom_swagger_ui_html():  # noqa: D401
+                return get_swagger_ui_html(
+                    openapi_url=app.openapi_url,
+                    title=f"{app.title} — Swagger UI",
+                    oauth2_redirect_url=app.swagger_ui_oauth2_redirect_url,
+                    swagger_js_url="/static/vendor/swagger/swagger-ui-bundle.js",
+                    swagger_css_url="/static/vendor/swagger/swagger-ui.css",
+                    swagger_favicon_url="/static/vendor/favicon.png",
+                )
+
+            @app.get(app.swagger_ui_oauth2_redirect_url, include_in_schema=False)
+            async def swagger_ui_redirect():  # noqa: D401
+                return get_swagger_ui_oauth2_redirect_html()
+
+        # Serve the browser's implicit /favicon.ico request from the local asset so
+        # it is neither a 404 nor blocked by the CSP (img-src 'self').
+        if os.path.isfile(_favicon):
+
+            @app.get("/favicon.ico", include_in_schema=False)
+            async def favicon():  # noqa: D401
+                return FileResponse(_favicon, media_type="image/png")
 
     logger.info(
         "ChatAPI booted: title=%r origins=%s screenshot=%s auth=%s metrics=%s",

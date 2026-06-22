@@ -1,12 +1,84 @@
 [project]
-name = "ai-agents"
+name = "mosdac-graphrag-agent"
 version = "0.1.0"
-description = "Add your description here"
+description = "MOSDAC GraphRAG chatbot — FastAPI gateway over a hybrid graph + vector RAG pipeline."
 readme = "README.md"
 requires-python = ">=3.11"
+
+# SINGLE SOURCE OF TRUTH for the dependency graph (B3). These ranges match the
+# langchain 0.3 stack the project is built and tested on; every constraint has an
+# UPPER BOUND so a transitive major bump can't silently break production. Do NOT
+# raise langchain to >=0.4/1.x — it drags langchain-chroma / langchain-neo4j up
+# and breaks the 0.3-era integrations. `requirement.txt` mirrors this set for the
+# pip-based Docker build; keep the two in sync.
 dependencies = [
-    "langchain>=1.2.18",
-    "langchain-community>=0.4.1",
-    "langchain-openai>=1.2.1",
-    "python-dotenv>=1.2.2",
+    # Core LangChain (pinned to the 0.3 line)
+    "langchain>=0.3,<0.4",
+    "langchain-core>=0.3,<0.4",
+    "langchain-community>=0.3,<0.4",
+    "langchain-openai>=0.2,<0.4",
+    "langchain-text-splitters>=0.3,<0.4",
+    "langchain-chroma>=0.1,<0.3",
+    "langchain-neo4j>=0.1,<0.6",
+    # LLM SDK
+    "openai>=1.0,<2",
+    # Vector DB
+    "chromadb>=0.5,<2",
+    # Graph DB
+    "neo4j>=5.0,<6",
+    # Document loaders / parsing
+    "pypdf>=4.0,<6",
+    "pymupdf>=1.24,<2",
+    "pytesseract>=0.3,<0.4",
+    "pdf2image>=1.17,<2",
+    "Pillow>=10.0,<12",
+    "beautifulsoup4>=4.12,<5",
+    "lxml>=5.0,<6",
+    "unstructured>=0.14,<0.24",
+    "docling>=2.15,<3",
+    # NLP
+    "spacy>=3.7,<4",
+    # Web framework
+    "fastapi>=0.100,<1",
+    "uvicorn[standard]>=0.23,<1",
+    # SSO / JWT (crypto extra for RS256 JWKS verification)
+    "PyJWT[crypto]>=2.8,<3",
+    # Hybrid search
+    "rank-bm25>=0.2.2,<0.3",
+    # Rate limiting (REQUIRED — the public endpoint fails closed without it)
+    "slowapi>=0.1.9,<0.2",
+    # Observability
+    "prometheus-client>=0.20,<1",
+    # Utilities
+    "python-dotenv>=1.0,<2",
+    "pydantic>=2.0,<3",
+    "pydantic-settings>=2.0,<3",
+    "tqdm>=4.0,<5",
+    "typer>=0.12,<1",
+    "requests>=2.31,<3",
 ]
+
+[project.optional-dependencies]
+# Pluggable session backend (multi-replica / persistent sessions).
+redis = ["redis>=5.0,<7"]
+# Shared conversation store for multi-replica deployments (H4).
+postgres = ["psycopg[binary,pool]>=3.1,<4"]
+# Evaluation — RAGAS production gate (evaluation_plan.md). Pinned to the 0.2 line
+# so it targets the langchain 0.3 stack above; do NOT unpin to >=0.3.
+eval = [
+    "ragas>=0.2,<0.3",
+    "datasets>=2.0,<4",
+]
+# Test/dev tooling.
+dev = [
+    "pytest>=8.0,<9",
+    "pytest-mock>=3.12,<4",
+    "httpx>=0.27,<1",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["chat_api", "graph_rag", "guardrails", "observability"]

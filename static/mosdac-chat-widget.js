@@ -13,9 +13,15 @@
     botTitle:      'MOSDAC BOT',
     // ISRO logo — override per deployment with whatever the site serves.
     logoUrl:       '/static/isro-logo.png',
-    greeting:      "Hey User, what's on your mind today?",
+    // {name} → the signed-in username (or "User" before sign-in). See renderGreeting().
+    greeting:      "Hey {name}, what's on your mind today?",
     suggestions:   ['How can you help me browse?', 'What can you do?', 'Explain a topic'],
     elementPrefix: 'mosdac',
+    // Where "Sign in" sends an anonymous user. Drupal's OpenID Connect login route
+    // is the default; it signs the user in portal-wide and then exposes the token to
+    // the page (meta tag below). The backend can override this via GET /config
+    // (CHAT_API_LOGIN_URL). Set to '' to hide the Sign-in button.
+    loginUrl:      '/user/login',
     // Default SSO token source: a token injected server-side by Drupal/OIDC into a
     // JS variable or <meta name="kc-token">. No token → anonymous, ephemeral chat.
     getToken: function () {

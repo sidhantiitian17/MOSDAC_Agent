@@ -27,13 +27,22 @@
     apiBase:          '/chatapi',
     botTitle:         'MOSDAC BOT',
     logoUrl:          '',
-    greeting:         "Hey User, what's on your mind today?",
+    // `{name}` is substituted with the signed-in username (or `anonymousName` when
+    // anonymous). A greeting without the token still works — see renderGreeting().
+    greeting:         "Hey {name}, what's on your mind today?",
+    anonymousName:    'User',        // shown in the greeting before sign-in
     suggestions:      ['How can you help me browse?', 'What can you do?', 'Explain a topic'],
     // Auth
     getToken:         null,          // () => string | Promise<string>
+    getUser:          null,          // optional () => {username} | Promise; else GET /me
     token:            '',            // static token alternative
     authMode:         'token',       // 'token' | 'none'
     sidebarEnabled:   true,
+    // SSO sign-in: where the "Sign in" button sends an anonymous user. A string is
+    // navigated to (with the current URL appended as `loginRedirectParam`); a
+    // function is just called (e.g. keycloak-js `() => kc.login()`). '' → no button.
+    loginUrl:           '',
+    loginRedirectParam: 'destination',
     // Colours
     accent:           '#1565c0',
     accentHover:      '#0d47a1',
@@ -91,6 +100,9 @@
     body:       `${P}-chat-body`,
     sidebar:    `${P}-chat-sidebar`,
     sidebarList:`${P}-chat-sidebar-list`,
+    signinCard: `${P}-chat-signin`,
+    signinBtn:  `${P}-chat-signin-btn`,
+    historyHdr: `${P}-chat-history-header`,
     newChat:    `${P}-chat-new`,
     chatArea:   `${P}-chat-area`,
     messages:   `${P}-chat-messages`,
@@ -114,6 +126,7 @@
   const state = {
     authed: false,
     token: '',
+    username: '',
     conversations: [],
     activeConversationId: null,
     sidebarOpen: false,
@@ -201,6 +214,42 @@
       #${ID.newChat}:hover { border-color: ${cfg.accent}; color: ${cfg.accent}; }
       #${ID.newChat} svg { width: 18px; height: 18px; }
       #${ID.sidebarList} { list-style: none; margin: 0; padding: 0 8px 12px; overflow-y: auto; flex: 1; }
+
+      /* ── Sign-in card (anonymous users) ────────────────────────────────── */
+      #${ID.signinCard} {
+        margin: 4px 12px 14px; padding: 18px 16px; text-align: center;
+        background: #eef4fe; border: 1px solid ${cfg.borderColor}; border-radius: 14px;
+      }
+      .${P}-signin-avatar {
+        position: relative; width: 56px; height: 56px; margin: 2px auto 12px;
+        border-radius: 50%; background: #dbe8fd; color: ${cfg.accent};
+        display: flex; align-items: center; justify-content: center;
+      }
+      .${P}-signin-avatar > svg { width: 30px; height: 30px; }
+      .${P}-signin-lock {
+        position: absolute; right: -2px; bottom: -2px; width: 22px; height: 22px;
+        border-radius: 50%; background: ${cfg.accent}; color: #fff; border: 2px solid #eef4fe;
+        display: flex; align-items: center; justify-content: center;
+      }
+      .${P}-signin-lock svg { width: 12px; height: 12px; }
+      .${P}-signin-title { font-size: 18px; font-weight: 700; color: ${cfg.textColor}; }
+      .${P}-signin-sub {
+        font-size: 13px; color: ${cfg.mutedColor}; margin: 6px 4px 14px; line-height: 1.45;
+      }
+      #${ID.signinBtn} {
+        width: 100%; padding: 11px 14px; border: none; border-radius: 10px;
+        background: ${cfg.accent}; color: #fff; font-size: 14px; font-weight: 600;
+        cursor: pointer; display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+      }
+      #${ID.signinBtn}:hover { background: ${cfg.accentHover}; }
+      #${ID.signinBtn} svg { width: 18px; height: 18px; }
+
+      /* ── "Chat History" section header (authenticated users) ───────────── */
+      #${ID.historyHdr} {
+        display: flex; align-items: center; gap: 8px; padding: 4px 18px 8px;
+        font-size: 13px; font-weight: 700; color: ${cfg.textColor};
+      }
+      #${ID.historyHdr} svg { width: 16px; height: 16px; }
       .${CLS.convItem} {
         display: flex; align-items: center; gap: 6px; padding: 9px 10px; margin: 2px 0;
         border-radius: 8px; cursor: pointer; font-size: 13.5px; color: ${cfg.textColor};
@@ -323,6 +372,7 @@
       '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
     }[c]));
   }
+  function escapeRegExp(s) { return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
 
   // Icon glyphs (outline icons use stroke; filled use fill — set inline so the
   // shadow stylesheet never has to special-case fill vs stroke per button).
@@ -333,6 +383,9 @@
     close:   `<svg viewBox="0 0 24 24" fill="currentColor"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12 19 6.41z"/></svg>`,
     plus:    `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>`,
     send:    `<svg viewBox="0 0 24 24" fill="currentColor"><path d="M3.4 20.4 21 12 3.4 3.6 3.4 10.1 15 12 3.4 13.9z"/></svg>`,
+    user:    `<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>`,
+    lock:    `<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 1a5 5 0 0 0-5 5v3H6a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-9a2 2 0 0 0-2-2h-1V6a5 5 0 0 0-5-5zm3 8H9V6a3 3 0 0 1 6 0v3z"/></svg>`,
+    clock:   `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>`,
   };
 
   function buildDOM() {
@@ -373,6 +426,15 @@
         <div id="${ID.body}">
           <aside id="${ID.sidebar}">
             <button id="${ID.newChat}">${ICON.edit} New chat</button>
+            <div id="${ID.signinCard}" style="display:none">
+              <div class="${P}-signin-avatar">
+                ${ICON.user}<span class="${P}-signin-lock">${ICON.lock}</span>
+              </div>
+              <div class="${P}-signin-title">Sign in</div>
+              <div class="${P}-signin-sub">Sign in to enable persistent chat history and personalized experiences.</div>
+              <button id="${ID.signinBtn}">${ICON.user} Sign in</button>
+            </div>
+            <div id="${ID.historyHdr}" style="display:none">${ICON.clock}<span>Chat History</span></div>
             <ul id="${ID.sidebarList}"></ul>
           </aside>
 
@@ -422,8 +484,11 @@
   const panel = el(ID.panel), toggleBtn = el(ID.toggle), closeBtn = el(ID.close);
   const hamburger = el(ID.hamburger), sidebar = el(ID.sidebar);
   const sidebarList = el(ID.sidebarList), newChatBtn = el(ID.newChat);
+  const signinCard = el(ID.signinCard), signinBtn = el(ID.signinBtn);
+  const historyHeader = el(ID.historyHdr);
   const headerNewBtn = el(ID.headerNew);
   const messages = el(ID.messages), emptyState = el(ID.empty);
+  const greetingEl = emptyState.querySelector('h2');
   const input = el(ID.input), sendBtn = el(ID.sendBtn), ssBtn = el(ID.ssBtn);
   const preview = el(ID.preview), previewImg = el(ID.previewImg), removeBtn = el(ID.removeBtn);
   const titleEl = panel.querySelector('.' + P + '-title');
@@ -445,10 +510,62 @@
     if (token) h['Authorization'] = 'Bearer ' + token;
     return h;
   }
+  // A sign-in path exists when auth isn't disabled and a login target is set.
+  function canSignIn() {
+    return !state.authed && cfg.authMode !== 'none' && !!cfg.loginUrl;
+  }
   function updateChromeForAuth() {
-    const showSidebar = cfg.sidebarEnabled && state.authed;
-    hamburger.style.display = showSidebar ? '' : 'none';
-    if (!showSidebar) closeSidebar();
+    // The sidebar toggle is available to authenticated users (their history) and to
+    // anonymous users when a sign-in path exists (so they can reach the Sign-in card).
+    const showToggle = cfg.sidebarEnabled && (state.authed || canSignIn());
+    hamburger.style.display = showToggle ? '' : 'none';
+    if (!showToggle) closeSidebar();
+    // Toggle the sidebar's two faces: Sign-in card (anonymous) vs. history (authed).
+    if (signinCard) signinCard.style.display = canSignIn() ? '' : 'none';
+    updateHistoryHeader();
+  }
+  // "Chat History" header only makes sense once an authed user has conversations.
+  function updateHistoryHeader() {
+    if (historyHeader) {
+      historyHeader.style.display =
+        state.authed && state.conversations.length > 0 ? '' : 'none';
+    }
+  }
+  // Begin SSO login. A function loginUrl is called as-is (e.g. keycloak-js
+  // `kc.login()`); a string is navigated to with the current page appended so the
+  // portal returns the user here after authenticating.
+  function signIn() {
+    const target = cfg.loginUrl;
+    if (!target) return;
+    if (typeof target === 'function') { target(); return; }
+    const sep = target.indexOf('?') === -1 ? '?' : '&';
+    const url = target + sep + encodeURIComponent(cfg.loginRedirectParam) +
+                '=' + encodeURIComponent(location.href);
+    window.location.assign(url);
+  }
+  // Resolve the display name for the greeting: a getUser() override if provided,
+  // else GET /me (which applies the server-side JWT_FIELD_USERNAME mapping).
+  async function resolveUser() {
+    if (!state.authed) { state.username = ''; return; }
+    try {
+      if (typeof cfg.getUser === 'function') {
+        const u = await cfg.getUser();
+        state.username = (u && (u.username || u.name)) || '';
+      } else {
+        const res = await fetch(cfg.apiBase + '/me', { headers: await authHeaders() });
+        if (res.ok) {
+          state.username = (await res.json()).username || '';
+        } else if (res.status === 401 || res.status === 403) {
+          // Token present but rejected (expired/invalid). Revert to signed-out so the
+          // Sign-in card returns, instead of showing a half-authenticated state
+          // (no Sign-in button yet greeting stuck on the anonymous name).
+          state.authed = false;
+          state.token = '';
+          state.username = '';
+          updateChromeForAuth();
+        }
+      }
+    } catch (e) { /* fall back to anonymousName */ }
   }
 
   // ── Conversation list (sidebar) ──────────────────────────────────────────────
@@ -464,6 +581,7 @@
 
   function renderConversations() {
     sidebarList.innerHTML = '';
+    updateHistoryHeader();
     state.conversations.forEach(c => {
       const li = document.createElement('li');
       li.className = CLS.convItem + (c.id === state.activeConversationId ? ' active' : '');
@@ -530,6 +648,23 @@
   function updateEmptyState() {
     const hasMsgs = messages.querySelector('.' + CLS.msg) !== null;
     emptyState.style.display = hasMsgs ? 'none' : '';
+  }
+  // Personalize the empty-state greeting. Prefers the `{name}` token; otherwise
+  // (back-compat with a literal "Hey User, …") swaps the standalone anonymousName
+  // word once. Anonymous → anonymousName ("User"); signed-in → the username.
+  function renderGreeting() {
+    if (!greetingEl) return;
+    const name = state.authed ? (state.username || cfg.anonymousName) : cfg.anonymousName;
+    const g = cfg.greeting || '';
+    let out;
+    if (g.indexOf('{name}') !== -1) {
+      out = g.replace(/\{name\}/g, name);
+    } else if (name && name !== cfg.anonymousName) {
+      out = g.replace(new RegExp('\\b' + escapeRegExp(cfg.anonymousName) + '\\b'), name);
+    } else {
+      out = g;
+    }
+    greetingEl.textContent = out;
   }
   function clearMessages() {
     messages.querySelectorAll('.' + CLS.msg).forEach(n => n.remove());
@@ -657,12 +792,18 @@
     previewImg.src = dataUrl; preview.style.display = 'flex';
   }
 
-  // ── Remote /config (title + screenshot availability) ─────────────────────────
+  // ── Remote /config (title + screenshot availability + sign-in path) ──────────
   if (cfg.fetchRemoteConfig) {
     fetch(cfg.apiBase + '/config').then(r => r.ok ? r.json() : null).then(remote => {
       if (!remote) return;
       if (!userCfg.botTitle && !userCfg.title && remote.bot_name) titleEl.textContent = remote.bot_name;
       if (remote.screenshot_enabled === false && ssBtn) ssBtn.style.display = 'none';
+      // Adopt the server-configured login URL unless the page set one explicitly,
+      // then re-evaluate chrome (a sign-in path may now exist for anonymous users).
+      if (!userCfg.loginUrl && remote.login_url) {
+        cfg.loginUrl = remote.login_url;
+        updateChromeForAuth();
+      }
     }).catch(() => {});
   }
 
@@ -672,6 +813,7 @@
   hamburger.addEventListener('click', toggleSidebar);
   newChatBtn.addEventListener('click', newChat);
   if (headerNewBtn) headerNewBtn.addEventListener('click', newChat);
+  if (signinBtn) signinBtn.addEventListener('click', signIn);
   sendBtn.addEventListener('click', () => sendMessage());
   if (ssBtn) ssBtn.addEventListener('click', takeScreenshot);
   if (removeBtn) removeBtn.addEventListener('click', clearAttachment);
@@ -704,7 +846,13 @@
     await authHeaders();        // resolves state.authed
     updateChromeForAuth();
     updateEmptyState();
-    await loadConversations();
+    renderGreeting();           // anonymous → uses anonymousName ("User")
+    if (state.authed) {         // probe /me first: sets the username, or downgrades to
+      await resolveUser();      // anonymous if the token is rejected (expired/invalid)
+      updateChromeForAuth();
+      renderGreeting();
+    }
+    await loadConversations();  // no-op unless still authed after the /me probe
   })();
 
   // ── Public API ───────────────────────────────────────────────────────────────
@@ -713,6 +861,7 @@
     close: closePanel,
     send: text => sendMessage(text),
     newChat,
+    signIn,
     refreshHistory: loadConversations,
     config: cfg,
     state,

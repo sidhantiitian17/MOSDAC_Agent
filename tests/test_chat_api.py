@@ -162,7 +162,17 @@ def test_service_text_chat_uses_chain_and_records_history():
     assert turns[1] == {"role": "assistant", "content": "text-answer"}
 
 
-def test_service_image_chat_uses_llm_directly():
+def test_service_image_chat_uses_llm_directly(monkeypatch):
+    # The image path is hard-gated on a configured vision model (M6); configure one
+    # so this test exercises the real multimodal plumbing.
+    from chat_api import service as service_mod
+    from chat_api.config import ChatAPISettings
+
+    monkeypatch.setattr(
+        service_mod, "chat_api_settings",
+        ChatAPISettings(_env_file=None, enable_screenshot=True, vision_model="test-vlm"),
+        raising=False,
+    )
     service, retriever, chain, llm, _sessions = _make_service()
     b64 = base64.b64encode(b"fake-image-bytes").decode()
     answer, _citations, _grounded, refused = service.chat(
@@ -255,6 +265,9 @@ def test_config_endpoint(test_client):
     assert "title" in body
     assert "bot_name" in body
     assert "screenshot_enabled" in body
+    # Sign-in metadata the widget reads to decide whether/where to show "Sign in".
+    assert "auth_enabled" in body
+    assert "login_url" in body
 
 
 _SID1 = "00000000-0000-0000-0000-000000000001"
@@ -279,6 +292,13 @@ def test_chat_clear_endpoint(test_client):
     r = client.delete(f"/chat/{_SID2}")
     assert r.status_code == 200
     assert sessions.get(_SID2) == []
+
+
+def test_clear_session_rejects_non_uuid(test_client):
+    """M4: DELETE /chat/{session_id} validates the id shape (400 on non-UUID)."""
+    client, _ = test_client
+    r = client.delete("/chat/not-a-uuid")
+    assert r.status_code == 400
 
 
 def test_chat_bad_request_on_invalid_screenshot(test_client):
@@ -364,6 +384,16 @@ def test_image_path_goes_through_check_output(monkeypatch):
     from chat_api.service import ChatService
     from chat_api.session import InMemorySessionStore
     from guardrails import get_pipeline
+
+    # The image path is hard-gated on a configured vision model (M6).
+    from chat_api import service as service_mod
+    from chat_api.config import ChatAPISettings
+
+    monkeypatch.setattr(
+        service_mod, "chat_api_settings",
+        ChatAPISettings(_env_file=None, enable_screenshot=True, vision_model="test-vlm"),
+        raising=False,
+    )
 
     pipeline = get_pipeline()
     called_with = {}
@@ -624,6 +654,41 @@ def test_authed_chat_continues_existing_conversation(authed_client):
     )
     assert r2.json()["conversation_id"] == cid
     assert len(repo.list_messages("userA", cid)) == 4
+
+
+def test_me_endpoint_returns_profile(authed_client):
+    """GET /me returns the normalized user (claim-mapped server-side)."""
+    client, _repo, _app = authed_client
+    r = client.get("/me")
+    assert r.status_code == 200
+    assert r.json() == {"id": "userA", "username": "alice", "email": "a@x"}
+
+
+def test_me_endpoint_503_when_auth_disabled(test_client, monkeypatch):
+    """With auth disabled, /me reports the feature is unavailable.
+
+    Patched explicitly (not relying on the ambient .env, which may enable auth for
+    a real SSO deployment) so the test is hermetic either way.
+    """
+    from chat_api.config import ChatAPISettings
+
+    fresh = ChatAPISettings(_env_file=None)
+    fresh.auth_enabled = False
+    monkeypatch.setattr("chat_api.auth.chat_api_settings", fresh)
+    client, _ = test_client
+    assert client.get("/me").status_code == 503
+
+
+def test_me_endpoint_401_when_token_missing(test_client, monkeypatch):
+    """Auth enabled but no bearer token → 401 (never silently anonymous)."""
+    from chat_api.config import ChatAPISettings
+
+    fresh = ChatAPISettings(_env_file=None)
+    fresh.auth_enabled = True
+    fresh.keycloak_issuer = "https://kc/realms/m"
+    monkeypatch.setattr("chat_api.auth.chat_api_settings", fresh)
+    client, _ = test_client
+    assert client.get("/me").status_code == 401
 
 
 def test_list_conversations_endpoint(authed_client):

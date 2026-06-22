@@ -22,13 +22,21 @@ services:
     image: neo4j:5.18.0
     container_name: mosdac_neo4j
     restart: unless-stopped
+    # B2: bind to loopback ONLY — chat_api reaches Neo4j over the compose network
+    # via bolt://neo4j:7687, so the host ports are needed only for local admin
+    # (Browser at 127.0.0.1:7474). They are NEVER published on 0.0.0.0, so the
+    # graph is not reachable from the network even though auth is also enabled.
     ports:
-      - "7474:7474"
-      - "7687:7687"
+      - "127.0.0.1:7474:7474"
+      - "127.0.0.1:7687:7687"
     environment:
-      # Auth disabled — any creds the client sends (NEO4J_USERNAME / NEO4J_PASSWORD
-      # in .env) are ignored by the server.
-      NEO4J_AUTH: none
+      # B2: authentication ENABLED. The server password and the client creds
+      # (NEO4J_USERNAME / NEO4J_PASSWORD, read by graph_rag) must match — both come
+      # from .env. NOTE: NEO4J_AUTH only initialises a FRESH ./neo4j_data volume; an
+      # existing volume created with AUTH=none keeps its setting until you reset it
+      # (`docker compose run --rm neo4j neo4j-admin dbms set-initial-password ...`)
+      # or recreate ./neo4j_data. Set a STRONG NEO4J_PASSWORD in .env for prod.
+      NEO4J_AUTH: "neo4j/${NEO4J_PASSWORD:-please-change-me}"
       NEO4J_server_memory_heap_max__size: "2G"
     volumes:
       - ./neo4j_data:/data        # bind mount — graph survives container recreation
@@ -45,11 +53,15 @@ services:
     image: redis:7-alpine
     container_name: mosdac_redis
     restart: unless-stopped
-    command: ["redis-server", "--save", "60", "1", "--appendonly", "no"]
+    # L6: require a password (defense-in-depth). Redis is NOT host-published (no
+    # ports:), so it is internal-only, but auth means a compromised neighbour
+    # container still can't read session data. Override REDIS_PASSWORD in .env.
+    command: ["redis-server", "--save", "60", "1", "--appendonly", "no", "--requirepass", "${REDIS_PASSWORD:-mosdac-redis}"]
     volumes:
       - redis_data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      # Authenticated ping so the healthcheck still passes with requirepass on.
+      test: ["CMD-SHELL", "redis-cli -a \"${REDIS_PASSWORD:-mosdac-redis}\" ping | grep -q PONG"]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -69,22 +81,45 @@ services:
       # Inside the compose network, reach Neo4j by its service name — overrides
       # the bolt://localhost:7687 value carried in .env.
       NEO4J_URI: bolt://neo4j:7687
+      # The atlas/download bind mounts below land at /app/atlases and /app/downloads,
+      # but .env carries ATLASES_DIR=./atlases_pdfs which resolves to /app/atlases_pdfs
+      # (EMPTY) inside the container. Pin both to the real mount targets so the
+      # container's `python main.py ingest` actually discovers the corpus.
+      DOWNLOADS_DIR: /app/downloads
+      ATLASES_DIR: /app/atlases
       # chat_api runs in a container; Tabby ML and Ollama run on the host.
       # localhost inside the container means the container itself, so override
       # both services to use host.docker.internal (or a LAN address for ISRO).
       TABBY_BASE_URL: ${TABBY_BASE_URL_DOCKER:-http://host.docker.internal:8080/v1}
       # Fix Bug #2: OLLAMA_BASE_URL was missing — container localhost ≠ host port 11434.
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL_DOCKER:-http://host.docker.internal:11434}
-      # Persistent sessions (production.md P0-2): use Redis by service name so a
-      # multi-worker/replica deploy never splits session state across workers.
+      # Sessions still use Redis by service name (survives restarts). This is a
+      # SINGLE-NODE reference stack: one chat_api container, one uvicorn worker,
+      # SQLite conversation history on a durable named volume — all consistent.
       CHAT_API_SESSION_BACKEND: ${CHAT_API_SESSION_BACKEND:-redis}
-      CHAT_API_REDIS_URL: ${CHAT_API_REDIS_URL:-redis://redis:6379/0}
-      CHAT_API_REQUIRE_PERSISTENT_SESSIONS: ${CHAT_API_REQUIRE_PERSISTENT_SESSIONS:-true}
+      # Includes the Redis password (L6). Override the whole URL via .env if needed.
+      CHAT_API_REDIS_URL: ${CHAT_API_REDIS_URL:-redis://:${REDIS_PASSWORD:-mosdac-redis}@redis:6379/0}
+      # Default false for this single-node stack (Redis already persists sessions).
+      # FOR MULTI-REPLICA: set this true AND CHAT_API_CONV_STORE=postgres with
+      # CHAT_API_POSTGRES_DSN — the factory refuses sqlite in that mode (H4), since
+      # a local SQLite file would split each user's history across replicas.
+      CHAT_API_REQUIRE_PERSISTENT_SESSIONS: ${CHAT_API_REQUIRE_PERSISTENT_SESSIONS:-false}
+      # Pin the SQLite path onto the durable named volume (H3/H4) so it wins over
+      # any CHAT_API_SQLITE_PATH in .env and history survives container recreation.
+      CHAT_API_SQLITE_PATH: /app/data/conversations.db
     extra_hosts:
       - "host.docker.internal:host-gateway"   # lets the container reach host Tabby
     volumes:
+      # chroma_db is a HOST bind mount. ChromaDB opens its SQLite store read-WRITE
+      # even for reads, so the non-root app user (H3) must own it — docker-entrypoint.sh
+      # chowns this mount (and /app/data) to UID 10001 at startup, so no manual
+      # `chown` on the host is needed. (This is why the container starts as root
+      # and immediately drops to appuser via gosu — only the chown runs as root.)
       - ./chroma_db:/app/chroma_db
       - ./prompts:/app/prompts
+      # Durable, writable SQLite store for per-user history (named volume, owned by
+      # the non-root appuser). Matches CHAT_API_SQLITE_PATH=/app/data/... in the image.
+      - conv_data:/app/data
       - ${DOWNLOADS_DIR:-./downloads}:/app/downloads:ro
       - ${ATLASES_DIR:-./atlases_pdfs}:/app/atlases:ro
     # Readiness-aware healthcheck (P0-4): the LB / orchestrator only routes traffic
@@ -104,5 +139,6 @@ services:
 volumes:
   neo4j_logs:
   redis_data:
+  conv_data:        # per-user SQLite chat history (survives container recreation)
   # neo4j_data is a host bind mount (./neo4j_data) — not a named volume.
   # ollama_data and hf_cache removed — Tabby ML runs as a separate container.

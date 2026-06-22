@@ -157,6 +157,14 @@ class ChatService:
             base64.b64decode(screenshot_b64, validate=True)
         except (binascii.Error, ValueError) as exc:
             raise ValueError(f"Invalid base64 screenshot data: {exc}") from exc
+        # Hard gate (M6): never feed an image to a text-only model. Checked here —
+        # after size/format validation but BEFORE any conversation row is created
+        # in the authenticated path — so a no-VLM deployment refuses cleanly.
+        if not chat_api_settings.vision_model:
+            raise ValueError(
+                "Screenshot analysis is not available: no vision model is configured "
+                "on this deployment (set CHAT_API_VISION_MODEL)."
+            )
 
     def _answer_with_image(
         self,
@@ -175,7 +183,7 @@ class ChatService:
         from guardrails.templates import REFUSAL_NO_CONTEXT
         from graph_rag.config import settings as gs
 
-        self._validate_screenshot(screenshot_b64)
+        self._validate_screenshot(screenshot_b64)  # also hard-gates on vision_model (M6)
         search_query = self._contextualize(message, history_prefix)
         ctx = self._retriever.retrieve(search_query)
         hits = ctx.get("_hits", [])

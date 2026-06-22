@@ -42,7 +42,10 @@ class ChatAPISettings(BaseSettings):
         # Add MOSDAC subdomains here if needed, e.g.:
         # ",https://vedas.mosdac.gov.in"
     )
-    allowed_methods: str = "GET,POST,OPTIONS"
+    # DELETE is required: the widget calls DELETE /conversations/{id} and
+    # DELETE /chat/{session_id}. Omitting it makes cross-origin deletes fail the
+    # CORS preflight (only masked when same-origin via the nginx /chatapi proxy).
+    allowed_methods: str = "GET,POST,DELETE,OPTIONS"
     allowed_headers: str = "Content-Type,Authorization,Accept"
 
     # Session / history
@@ -62,12 +65,15 @@ class ChatAPISettings(BaseSettings):
     require_persistent_sessions: bool = False
 
     # Multimodal
-    enable_screenshot: bool = True
+    # OFF by default: the default chat model is text-only, so accepting screenshots
+    # without a configured VLM just ships 8 MB uploads to a model that cannot see
+    # them (misleading UX + wasted tokens). Turn this ON only together with a real
+    # CHAT_API_VISION_MODEL — the image path is hard-gated on it (see service.py).
+    enable_screenshot: bool = False
     max_screenshot_bytes: int = 8 * 1024 * 1024  # 8 MB
     # Identifier of the vision-capable model serving the screenshot path. Empty =
-    # no VLM wired; a startup warning fires and operators should set
-    # CHAT_API_ENABLE_SCREENSHOT=false until a real VLM backend is configured
-    # (the default chat model is text-only). Informational/guard for P0-3.
+    # no VLM wired → the image path refuses with a clear message rather than
+    # silently feeding the image to a text-only model (M6).
     vision_model: str = ""
 
     # ── Request limits (P1-2) ───────────────────────────────────────────────
@@ -81,10 +87,18 @@ class ChatAPISettings(BaseSettings):
     # When set, every /chat request must carry this token (X-API-Key or
     # Authorization: Bearer). Empty = open endpoint (public-portal default).
     api_key: str = ""
-    # Trust X-Forwarded-For for the real client IP when running behind a known
+    # Trust the proxy-set client-IP headers (X-Real-IP, then the right-most
+    # X-Forwarded-For hop) for the real client IP when running behind a known
     # reverse proxy / load balancer, so per-IP rate limiting keys on the actual
-    # client and not the proxy. Only enable when the proxy is trusted.
+    # client and not the proxy. Only enable when the proxy is trusted AND it
+    # overwrites these headers (nginx sets X-Real-IP $remote_addr) — otherwise a
+    # client could spoof its rate-limit key. MUST be true behind the bundled
+    # nginx config, or every client collapses into one shared rate-limit bucket.
     trust_forwarded_for: bool = False
+    # Fail CLOSED if the rate limiter cannot be attached at startup (e.g. slowapi
+    # missing). A public LLM endpoint must never boot silently without its primary
+    # abuse/DoS control. Set false ONLY for local dev where you accept no limiter.
+    require_rate_limit: bool = True
 
     # ── Answer cache (optional) ─────────────────────────────────────────────
     # Short-circuit repeated FAQ questions. Only grounded, non-refused answers are
@@ -127,6 +141,14 @@ class ChatAPISettings(BaseSettings):
     # URL is derived from it unless keycloak_jwks_url is set explicitly.
     keycloak_issuer: str = ""
     keycloak_jwks_url: str = ""
+    # Public (browser) OIDC client id for the standalone SSO test harness
+    # (static/sso-demo.html). Production Drupal gets the token server-side and does
+    # NOT use this; it only saves passing ?client= to the demo page. Empty = the demo
+    # falls back to its query-param / built-in default.
+    keycloak_public_client: str = Field(
+        default="",
+        validation_alias=AliasChoices("CHAT_API_KEYCLOAK_PUBLIC_CLIENT", "KEYCLOAK_PUBLIC_CLIENT"),
+    )
     # Audience(s) the access token must carry (comma-separated). Empty disables
     # the aud check (some Keycloak setups don't pin an audience on access tokens).
     keycloak_audience: str = ""
@@ -135,13 +157,26 @@ class ChatAPISettings(BaseSettings):
     jwt_algorithms: str = "RS256"
     # How long signing keys are cached before the JWKS endpoint is re-fetched.
     jwks_cache_seconds: int = 3600
+    # Portal SSO login route the widget's "Sign in" button redirects an anonymous
+    # user to (the portal/Drupal OIDC login that establishes a site-wide session and
+    # then exposes the token to the page). Empty = no Sign-in button is shown.
+    #   e.g. /user/login   (Drupal + OpenID Connect module)
+    login_url: str = Field(
+        default="",
+        validation_alias=AliasChoices("CHAT_API_LOGIN_URL", "LOGIN_URL"),
+    )
 
     # ── Conversation store (per-user chat history) ───────────────────────────
-    # "sqlite" persists conversations/messages for authenticated users so each
-    # user gets their own history sidebar. "none" disables persistence entirely
-    # (every request behaves like an anonymous, ephemeral session).
-    conv_store: str = "sqlite"            # "sqlite" | "none"
+    # "sqlite"   — local file; CORRECT FOR A SINGLE REPLICA ONLY (a multi-replica
+    #              deploy would split each user's history across replica files).
+    # "postgres" — shared DB; the multi-replica / scalable backend (H4). Needs
+    #              CHAT_API_POSTGRES_DSN and `pip install 'psycopg[binary,pool]'`.
+    # "none"     — disables persistence (every request is anonymous/ephemeral).
+    conv_store: str = "sqlite"            # "sqlite" | "postgres" | "none"
     sqlite_path: str = "./conversations.db"
+    # libpq DSN for the postgres backend, e.g.
+    #   postgresql://user:pass@db-host:5432/mosdac_chat
+    postgres_dsn: str = ""
 
     # Networking
     host: str = "0.0.0.0"
@@ -163,6 +198,19 @@ class ChatAPISettings(BaseSettings):
         if self.keycloak_issuer:
             return f"{self.keycloak_issuer.rstrip('/')}/protocol/openid-connect/certs"
         return ""
+
+    def keycloak_url_and_realm(self) -> tuple[str, str]:
+        """Split the issuer into (base_url, realm) so the SSO harness can self-configure.
+
+        ``http://host:8081/realms/master`` -> (``http://host:8081``, ``master``).
+        Returns ("", "") when no issuer is set. This is what stops static/sso-demo.html
+        from defaulting to a realm/host that does not match the backend (a 401 trap).
+        """
+        iss = self.keycloak_issuer.rstrip("/")
+        if "/realms/" in iss:
+            base, realm = iss.split("/realms/", 1)
+            return base, realm.split("/")[0]
+        return iss, ""
 
     def methods_list(self) -> List[str]:
         return [m.strip() for m in self.allowed_methods.split(",") if m.strip()]
