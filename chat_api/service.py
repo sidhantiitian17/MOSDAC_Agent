@@ -528,6 +528,11 @@ class ChatService:
         def _event(kind: str, payload: dict) -> str:
             return f"event: {kind}\ndata: {_json.dumps(payload)}\n\n"
 
+        # Flush an SSE comment immediately so the proxy/client see bytes before the
+        # retrieval + LLM-prefill gap (which precedes the first real token). This
+        # resets nginx's proxy_read_timeout and lets the widget show "connected".
+        yield ": keepalive\n\n"
+
         def _final(answer, citations, grounded, refused):
             _metric_inc("chat_requests_total", {"action": "refuse" if refused else "allow"})
             return _event("final", {

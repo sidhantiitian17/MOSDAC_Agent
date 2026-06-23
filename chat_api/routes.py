@@ -205,7 +205,19 @@ def build_router(service: ChatService, limiter=None) -> APIRouter:
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc))
-        return StreamingResponse(generator, media_type="text/event-stream")
+        # X-Accel-Buffering: no — tell nginx (the DDEV /chatapi reverse proxy) NOT to
+        # buffer the SSE body. Without it nginx holds the whole response until the
+        # generator finishes, so the client sees nothing for 45–109s and the request
+        # trips proxy_read_timeout — the exact "something went wrong" the widget showed.
+        return StreamingResponse(
+            generator,
+            media_type="text/event-stream",
+            headers={
+                "X-Accel-Buffering": "no",
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+            },
+        )
 
     @router.get("/conversations", response_model=List[ConversationOut])
     def list_conversations(user: NormalizedUser = Depends(get_current_user)):

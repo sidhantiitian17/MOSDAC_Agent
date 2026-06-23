@@ -60,6 +60,9 @@
     panelWidth:       420,
     enableScreenshot: true,
     fetchRemoteConfig: true,
+    // Base URL for the vendored KaTeX assets (katex.min.css/js + fonts). Empty →
+    // derived from this script's own URL, so it works at any mount path.
+    katexBase:        '',
   };
 
   const userCfg = window.GRAPH_RAG_CHAT_CONFIG || {};
@@ -67,6 +70,13 @@
   // Back-compat aliases (older config used title/botLogo).
   if (!userCfg.botTitle && userCfg.title) cfg.botTitle = userCfg.title;
   if (!userCfg.logoUrl && userCfg.botLogo) cfg.logoUrl = userCfg.botLogo;
+
+  // Resolve where sibling assets (vendored KaTeX) live. document.currentScript is
+  // valid here (we're still in the synchronous top-level of the script), so we can
+  // derive `<dir>/vendor/katex` from this file's own URL — no hardcoded path.
+  const WIDGET_SRC = (document.currentScript && document.currentScript.src) || '';
+  const KATEX_BASE = cfg.katexBase ||
+    (WIDGET_SRC ? WIDGET_SRC.replace(/[^/]*\.js(\?.*)?$/, 'vendor/katex') : '/static/vendor/katex');
 
   const P = cfg.elementPrefix;
   const SESSION_KEY = P + '_chat_sid';
@@ -128,6 +138,7 @@
     token: '',
     username: '',
     conversations: [],
+    localTitles: {},   // conversationId -> title derived from first user message
     activeConversationId: null,
     sidebarOpen: false,
     isWaiting: false,
@@ -297,6 +308,59 @@
       .${CLS.thumb} { max-width: 100%; border-radius: 8px; margin-top: 6px; display: block; border: 1px solid ${cfg.borderColor}; }
       .${CLS.typing} { color: ${cfg.mutedColor}; font-style: italic; }
 
+      /* ── Rendered Markdown answer (formatted bot bubble) ───────────────────
+         The base bot bubble keeps white-space:pre-wrap for the live streaming
+         preview; the formatted final answer carries .${P}-md, which switches to
+         normal flow so headings/lists/tables lay out correctly. */
+      .${P}-md { white-space: normal; }
+      .${P}-md > *:first-child { margin-top: 0; }
+      .${P}-md > *:last-child  { margin-bottom: 0; }
+      .${P}-md p { margin: 0 0 10px; }
+      .${P}-md h3, .${P}-md h4, .${P}-md h5, .${P}-md h6 {
+        margin: 14px 0 6px; line-height: 1.3; font-weight: 700; color: ${cfg.textColor};
+      }
+      .${P}-md h3 { font-size: 16px; }
+      .${P}-md h4 { font-size: 15px; }
+      .${P}-md h5, .${P}-md h6 { font-size: 14px; }
+      .${P}-md ul, .${P}-md ol { margin: 6px 0 10px; padding-left: 22px; }
+      .${P}-md li { margin: 3px 0; }
+      .${P}-md li > p { margin: 0; }
+      .${P}-md a { color: ${cfg.accent}; text-decoration: underline; word-break: break-all; }
+      .${P}-md strong { font-weight: 700; }
+      .${P}-md code {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 12.5px; background: rgba(0,0,0,.06); padding: 1px 5px; border-radius: 5px;
+      }
+      .${P}-md pre {
+        margin: 8px 0; padding: 10px 12px; background: #0f172a; color: #e2e8f0;
+        border-radius: 10px; overflow-x: auto;
+      }
+      .${P}-md pre code { background: none; color: inherit; padding: 0; font-size: 12.5px; line-height: 1.5; }
+      .${P}-md blockquote {
+        margin: 8px 0; padding: 4px 12px; border-left: 3px solid ${cfg.accent};
+        color: ${cfg.mutedColor};
+      }
+      .${P}-md hr { border: none; border-top: 1px solid ${cfg.borderColor}; margin: 12px 0; }
+      .${P}-md table {
+        border-collapse: collapse; margin: 10px 0; font-size: 13px;
+        display: block; max-width: 100%; overflow-x: auto;
+      }
+      .${P}-md th, .${P}-md td { border: 1px solid ${cfg.borderColor}; padding: 6px 10px; text-align: left; }
+      .${P}-md th { background: ${cfg.msgBotBg}; font-weight: 700; }
+      .${P}-math-block {
+        display: block; margin: 10px 0; padding: 8px 12px; overflow-x: auto;
+        background: rgba(0,0,0,.04); border-radius: 8px; text-align: center;
+        white-space: pre-wrap; font-size: 15px;
+        font-family: 'Cambria Math', 'Latin Modern Math', 'Times New Roman', serif;
+      }
+      .${P}-math-inline {
+        font-family: 'Cambria Math', 'Latin Modern Math', 'Times New Roman', serif;
+      }
+      /* KaTeX typeset output (katex.min.css is injected into the shadow root). Let
+         wide display equations scroll inside the narrow panel instead of clipping. */
+      .${P}-md .katex { color: ${cfg.textColor}; font-size: 1.05em; }
+      .${P}-md .katex-display { margin: 12px 0; overflow-x: auto; overflow-y: hidden; padding: 2px 0; }
+
       /* ── Attachment preview ────────────────────────────────────────────── */
       #${ID.preview} {
         margin: 0 14px 6px; padding: 6px 10px; background: ${cfg.msgBotBg};
@@ -345,8 +409,14 @@
       .${P}-dots span:nth-child(2) { animation-delay: .2s; }
       .${P}-dots span:nth-child(3) { animation-delay: .4s; }
       @keyframes ${P}-blink {
-        0%, 80%, 100% { opacity: .25; transform: translateY(0); }
-        40%           { opacity: 1;   transform: translateY(-3px); }
+        0%, 80%, 100% { opacity: .25; transform: translateY(0) scale(1); }
+        40%           { opacity: 1;   transform: translateY(-5px) scale(1.15); }
+      }
+      /* Reduced-motion fallback: a gentle opacity-only pulse (no positional motion)
+         so the indicator still reads as "working" instead of sitting frozen. */
+      @keyframes ${P}-fade {
+        0%, 80%, 100% { opacity: .3; }
+        40%           { opacity: 1; }
       }
 
       /* ── Subtle message entrance ───────────────────────────────────────── */
@@ -361,7 +431,7 @@
         #${ID.panel}, #${ID.sidebar}, #${ID.toggle},
         .${CLS.chip}, .${CLS.iconBtn}, .${P}-hdr-btn { transition: none !important; }
         .${CLS.msg} { animation: none !important; }
-        .${P}-dots span { animation: none !important; opacity: .55; transform: none; }
+        .${P}-dots span { animation: ${P}-fade 1.4s infinite both !important; transform: none !important; }
       }
     `;
     root.appendChild(style);
@@ -371,6 +441,173 @@
     return String(s).replace(/[&<>"']/g, c => ({
       '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
     }[c]));
+  }
+
+  // ── Markdown + math rendering ────────────────────────────────────────────────
+  // The backend answers in Markdown (Docling-parsed documents bring headings,
+  // bold/italics, lists, code blocks, tables and LaTeX math). The widget used to
+  // drop that source straight into `textContent`, so users saw raw `**bold**`,
+  // `$$…$$` and `\(…\)` markup instead of a formatted answer. renderMarkdown()
+  // turns it into clean, safe HTML. It is deliberately self-contained — no
+  // external library — so it keeps working in the air-gapped deployment. Every
+  // piece of model/user text is HTML-escaped before any tag is emitted and only a
+  // fixed whitelist of tags is produced, so the answer text cannot inject markup.
+
+  const PH = '';                       // private-use delimiter for placeholders
+  function makePlaceholder(kind, i) { return PH + kind + i + PH; }
+
+  // Allow http(s)/mailto and same-page/relative links; block javascript:, data:, …
+  function safeUrl(url) {
+    const u = String(url).trim();
+    if (/^(https?:|mailto:)/i.test(u)) return u;
+    if (/^[#/]/.test(u) || /^[\w.\-]+(\/|$)/.test(u)) return u;   // anchor / relative
+    return '#';
+  }
+
+  // Unicode super/subscripts + Greek letters, for light LaTeX prettification when
+  // no math typesetter is bundled. Anything not in the maps falls back gracefully.
+  const SUP = { '0':'⁰','1':'¹','2':'²','3':'³','4':'⁴','5':'⁵','6':'⁶','7':'⁷','8':'⁸','9':'⁹',
+    '+':'⁺','-':'⁻','=':'⁼','(':'⁽',')':'⁾','n':'ⁿ','i':'ⁱ' };
+  const SUB = { '0':'₀','1':'₁','2':'₂','3':'₃','4':'₄','5':'₅','6':'₆','7':'₇','8':'₈','9':'₉',
+    '+':'₊','-':'₋','=':'₌','(':'₍',')':'₎','a':'ₐ','e':'ₑ','h':'ₕ','i':'ᵢ','j':'ⱼ','k':'ₖ',
+    'l':'ₗ','m':'ₘ','n':'ₙ','o':'ₒ','p':'ₚ','r':'ᵣ','s':'ₛ','t':'ₜ','u':'ᵤ','v':'ᵥ','x':'ₓ' };
+  const SYM = { sum:'∑', int:'∫', oint:'∮', prod:'∏', partial:'∂', infty:'∞', exp:'exp',
+    log:'log', ln:'ln', sin:'sin', cos:'cos', tan:'tan', lim:'lim', pm:'±', mp:'∓',
+    times:'×', cdot:'·', div:'÷', ast:'∗', star:'⋆', le:'≤', leq:'≤', ge:'≥', geq:'≥',
+    neq:'≠', equiv:'≡', approx:'≈', sim:'∼', propto:'∝', nabla:'∇', forall:'∀', exists:'∃',
+    in:'∈', notin:'∉', subset:'⊂', supset:'⊃', cup:'∪', cap:'∩', to:'→', gets:'←',
+    rightarrow:'→', leftarrow:'←', Rightarrow:'⇒', Leftarrow:'⇐', leftrightarrow:'↔',
+    langle:'⟨', rangle:'⟩', lfloor:'⌊', rfloor:'⌋', ldots:'…', cdots:'⋯', dots:'…',
+    alpha:'α', beta:'β', gamma:'γ', delta:'δ', epsilon:'ε', varepsilon:'ε', zeta:'ζ',
+    eta:'η', theta:'θ', vartheta:'ϑ', iota:'ι', kappa:'κ', lambda:'λ', mu:'μ', nu:'ν',
+    xi:'ξ', pi:'π', rho:'ρ', sigma:'σ', tau:'τ', upsilon:'υ', phi:'φ', varphi:'φ',
+    chi:'χ', psi:'ψ', omega:'ω', Gamma:'Γ', Delta:'Δ', Theta:'Θ', Lambda:'Λ', Xi:'Ξ',
+    Pi:'Π', Sigma:'Σ', Phi:'Φ', Psi:'Ψ', Omega:'Ω' };
+
+  function toScript(s, map) {
+    let out = '';
+    for (const ch of s) { if (map[ch] == null) return null; out += map[ch]; }
+    return out;
+  }
+
+  // Best-effort LaTeX → readable Unicode. Not a full typesetter, but turns the
+  // common scientific notation the corpus produces into something legible instead
+  // of raw `\frac{}{}`, `\sum_{}` and `\lambda` source.
+  function prettifyMath(tex) {
+    let t = String(tex);
+    t = t.replace(/\\(left|right|big|Big|bigg|Bigg|displaystyle|textstyle|limits|,|;|:|!|quad|qquad)\b/g, ' ');
+    t = t.replace(/\\\\/g, '   ');                       // in-math line break → spaces
+    t = t.replace(/\\text\s*\{([^{}]*)\}/g, '$1');
+    for (let n = 0; n < 4; n++) {                        // resolve simple nesting
+      t = t.replace(/\\frac\s*\{([^{}]*)\}\s*\{([^{}]*)\}/g, '($1)/($2)');
+      t = t.replace(/\\sqrt\s*\{([^{}]*)\}/g, '√($1)');
+    }
+    t = t.replace(/\\([A-Za-z]+)/g, (m, name) => SYM[name] != null ? SYM[name] : name);
+    t = t.replace(/\^\{([^{}]*)\}|\^(\S)/g, (m, a, b) => {
+      const s = a != null ? a : b; return toScript(s, SUP) || '^(' + s + ')';
+    });
+    t = t.replace(/_\{([^{}]*)\}|_(\S)/g, (m, a, b) => {
+      const s = a != null ? a : b;
+      return toScript(s, SUB) || (a != null ? '_(' + s + ')' : '_' + s);
+    });
+    t = t.replace(/[{}]/g, '');
+    return t.replace(/[ \t]{2,}/g, ' ').trim();
+  }
+
+  // Inline span → escaped HTML with emphasis + links. `s` is raw markdown text;
+  // it is escaped first so any literal markup in it is inert.
+  function renderInline(s) {
+    s = escapeHTML(s);
+    s = s.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (m, txt, url) =>
+      '<a href="' + escapeHTML(safeUrl(url)) + '" target="_blank" rel="noopener noreferrer">' + txt + '</a>');
+    s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+    s = s.replace(/__([^_]+)__/g, '<strong>$1</strong>');
+    s = s.replace(/(^|[^*])\*([^*\n]+)\*/g, '$1<em>$2</em>');
+    s = s.replace(/(^|[^\w_])_([^_\n]+)_(?![\w_])/g, '$1<em>$2</em>');
+    s = s.replace(/~~([^~]+)~~/g, '<del>$1</del>');
+    return s;
+  }
+
+  function renderMarkdown(src) {
+    if (src == null) return '';
+    let text = String(src).replace(/\r\n?/g, '\n');
+    const codeBlocks = [], mathSpans = [], inlineCodes = [];
+    // Math is preserved verbatim (delimiters included) and only HTML-escaped — never
+    // markdown-processed — so `\frac{}{}`, `_`, `^`, `*` inside formulas survive.
+    // KaTeX auto-render typesets it once the HTML is in the DOM (see typesetMath).
+    const stashMath = m => { mathSpans.push(escapeHTML(m)); return makePlaceholder('M', mathSpans.length - 1); };
+
+    // Pull out content that markdown/escaping must not touch, leaving placeholders.
+    text = text.replace(/```[^\n]*\n([\s\S]*?)```/g, (m, code) => {
+      codeBlocks.push(escapeHTML(code.replace(/\n$/, '')));
+      return '\n' + makePlaceholder('C', codeBlocks.length - 1) + '\n';
+    });
+    text = text.replace(/\$\$[\s\S]+?\$\$/g, stashMath);     // display math: $$ … $$
+    text = text.replace(/\\\[[\s\S]+?\\\]/g, stashMath);     // display math: \[ … \]
+    text = text.replace(/\\\([\s\S]+?\\\)/g, stashMath);     // inline math:  \( … \)
+    text = text.replace(/`([^`\n]+)`/g, (m, code) => {
+      inlineCodes.push(escapeHTML(code)); return makePlaceholder('I', inlineCodes.length - 1);
+    });
+
+    // Block-level pass over raw lines (markdown markers like #, >, |, - intact).
+    const lines = text.split('\n');
+    const out = [];
+    let para = [];
+    const flushPara = () => { if (para.length) { out.push('<p>' + para.map(renderInline).join('<br>') + '</p>'); para = []; } };
+    const splitRow = r => r.trim().replace(/^\|/, '').replace(/\|$/, '').split('|').map(c => c.trim());
+
+    let k = 0;
+    while (k < lines.length) {
+      const line = lines[k], t = line.trim();
+      if (new RegExp('^' + PH + '[CM]\\d+' + PH + '$').test(t)) { flushPara(); out.push(t); k++; continue; }
+      if (!t) { flushPara(); k++; continue; }
+      const h = t.match(/^(#{1,6})\s+(.*)$/);
+      if (h) { flushPara(); const lvl = Math.min(h[1].length + 2, 6); out.push('<h' + lvl + '>' + renderInline(h[2]) + '</h' + lvl + '>'); k++; continue; }
+      if (/^([-*_])(\s*\1){2,}$/.test(t)) { flushPara(); out.push('<hr>'); k++; continue; }
+      // Markdown table: a header row followed by a |---|---| separator row.
+      if (t.indexOf('|') !== -1 && k + 1 < lines.length &&
+          /^\s*\|?\s*:?-{1,}:?\s*(\|\s*:?-{1,}:?\s*)+\|?\s*$/.test(lines[k + 1])) {
+        flushPara();
+        const head = splitRow(t); k += 2; const rows = [];
+        while (k < lines.length && lines[k].trim() && lines[k].indexOf('|') !== -1) { rows.push(splitRow(lines[k])); k++; }
+        let tbl = '<table><thead><tr>' + head.map(c => '<th>' + renderInline(c) + '</th>').join('') + '</tr></thead>';
+        if (rows.length) tbl += '<tbody>' + rows.map(r => '<tr>' + r.map(c => '<td>' + renderInline(c) + '</td>').join('') + '</tr>').join('') + '</tbody>';
+        out.push(tbl + '</table>'); continue;
+      }
+      if (/^>\s?/.test(t)) {
+        flushPara(); const q = [];
+        while (k < lines.length && /^>\s?/.test(lines[k].trim())) { q.push(lines[k].trim().replace(/^>\s?/, '')); k++; }
+        out.push('<blockquote>' + q.map(renderInline).join('<br>') + '</blockquote>'); continue;
+      }
+      if (/^[-*+]\s+/.test(t)) {
+        flushPara(); const items = [];
+        while (k < lines.length && /^[-*+]\s+/.test(lines[k].trim())) { items.push('<li>' + renderInline(lines[k].trim().replace(/^[-*+]\s+/, '')) + '</li>'); k++; }
+        out.push('<ul>' + items.join('') + '</ul>'); continue;
+      }
+      if (/^\d+[.)]\s+/.test(t)) {
+        flushPara(); const items = [];
+        while (k < lines.length && /^\d+[.)]\s+/.test(lines[k].trim())) { items.push('<li>' + renderInline(lines[k].trim().replace(/^\d+[.)]\s+/, '')) + '</li>'); k++; }
+        out.push('<ol>' + items.join('') + '</ol>'); continue;
+      }
+      para.push(t); k++;
+    }
+    flushPara();
+
+    // Re-insert the protected fragments.
+    return out.join('\n')
+      .replace(new RegExp(PH + 'C(\\d+)' + PH, 'g'), (m, i) => '<pre><code>' + codeBlocks[+i] + '</code></pre>')
+      .replace(new RegExp(PH + 'M(\\d+)' + PH, 'g'), (m, i) => mathSpans[+i])
+      .replace(new RegExp(PH + 'I(\\d+)' + PH, 'g'), (m, i) => '<code>' + inlineCodes[+i] + '</code>');
+  }
+
+  // Short, human-readable title derived from a user's first message. Used as an
+  // instant, optimistic sidebar label so a new chat is never stuck on "New chat"
+  // (e.g. when the backend skips LLM titling for a refused answer). The real
+  // LLM-generated title, when produced, overrides this in renderConversations().
+  function deriveTitle(text) {
+    const t = String(text).replace(/\s+/g, ' ').trim();
+    if (!t) return 'New chat';
+    return t.length > 40 ? t.slice(0, 40).trimEnd() + '…' : t;
   }
   function escapeRegExp(s) { return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
 
@@ -478,6 +715,101 @@
 
   injectCSS();
   buildDOM();
+
+  // ── KaTeX (math typesetting) — vendored, lazy-loaded, air-gapped ─────────────
+  // Loaded once on demand from the same-origin /static/vendor/katex bundle. The
+  // stylesheet is injected INTO the shadow root so KaTeX's classes style the
+  // typeset spans here and the CSS's relative font URLs resolve to
+  // /static/vendor/katex/fonts (same-origin; CSP default-src 'self').
+  let _katexPromise = null;
+  function loadScriptOnce(src) {
+    return new Promise((resolve, reject) => {
+      let s = document.querySelector('script[data-grag-katex][src="' + src + '"]');
+      if (s && s.dataset.loaded) { resolve(); return; }
+      if (!s) {
+        s = document.createElement('script');
+        s.src = src; s.async = false; s.setAttribute('data-grag-katex', '');
+        document.head.appendChild(s);
+      }
+      s.addEventListener('load', () => { s.dataset.loaded = '1'; resolve(); });
+      s.addEventListener('error', () => reject(new Error('load failed: ' + src)));
+    });
+  }
+  function appendStylesheet(parent, href) {
+    if (parent.querySelector('link[data-grag-katex][href="' + href + '"]')) return;
+    const link = document.createElement('link');
+    link.rel = 'stylesheet'; link.href = href; link.setAttribute('data-grag-katex', '');
+    parent.appendChild(link);
+  }
+  function ensureKatex() {
+    if (_katexPromise) return _katexPromise;
+    _katexPromise = (async () => {
+      const href = KATEX_BASE + '/katex.min.css';
+      // Shadow-root copy: KaTeX's .katex* layout classes must live inside the shadow
+      // tree to style the typeset spans (document CSS doesn't cross the boundary).
+      // Document-head copy: registers KaTeX's @font-face globally, the portable way
+      // to make the math fonts reach shadow content across browsers.
+      appendStylesheet(root, href);
+      appendStylesheet(document.head, href);
+      await loadScriptOnce(KATEX_BASE + '/katex.min.js');
+      await loadScriptOnce(KATEX_BASE + '/contrib/auto-render.min.js');
+      if (typeof window.renderMathInElement !== 'function') throw new Error('KaTeX auto-render unavailable');
+      return window.renderMathInElement;
+    })();
+    _katexPromise.catch(() => {});                   // callers handle failure via fallback
+    return _katexPromise;
+  }
+  const KATEX_DELIMS = [
+    { left: '$$', right: '$$', display: true },
+    { left: '\\[', right: '\\]', display: true },
+    { left: '\\(', right: '\\)', display: false },
+    // No single-`$` delimiter on purpose: it would mis-typeset prose like "$5 … $10".
+  ];
+  // Typeset any math in `div`. We only pay the KaTeX cost when a delimiter is
+  // actually present. If KaTeX can't load (assets missing/blocked), degrade to
+  // readable Unicode via prettifyFallback rather than leaving raw LaTeX on screen.
+  function typesetMath(div) {
+    if (!/\$\$|\\\(|\\\[/.test(div.textContent)) return;
+    ensureKatex().then(render => {
+      render(div, {
+        delimiters: KATEX_DELIMS,
+        throwOnError: false,
+        ignoredTags: ['script', 'noscript', 'style', 'textarea', 'pre', 'code'],
+      });
+    }).catch(() => prettifyFallback(div));
+  }
+  // Fallback when KaTeX is unavailable: replace $$…$$, \[…\], \(…\) runs with the
+  // best-effort Unicode rendering, skipping code so code samples are never rewritten.
+  function prettifyFallback(div) {
+    const rx = /\$\$([\s\S]+?)\$\$|\\\[([\s\S]+?)\\\]|\\\(([\s\S]+?)\\\)/g;
+    const walker = document.createTreeWalker(div, NodeFilter.SHOW_TEXT, {
+      acceptNode(n) {
+        for (let p = n.parentNode; p && p !== div; p = p.parentNode) {
+          if (p.tagName === 'CODE' || p.tagName === 'PRE') return NodeFilter.FILTER_REJECT;
+        }
+        rx.lastIndex = 0;
+        return rx.test(n.nodeValue) ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT;
+      },
+    });
+    const targets = [];
+    for (let n = walker.nextNode(); n; n = walker.nextNode()) targets.push(n);
+    targets.forEach(node => {
+      const s = node.nodeValue, frag = document.createDocumentFragment();
+      let last = 0, m; rx.lastIndex = 0;
+      while ((m = rx.exec(s))) {
+        if (m.index > last) frag.appendChild(document.createTextNode(s.slice(last, m.index)));
+        const display = m[1] != null || m[2] != null;
+        const tex = m[1] != null ? m[1] : (m[2] != null ? m[2] : m[3]);
+        const span = document.createElement(display ? 'div' : 'span');
+        span.className = P + '-math ' + (display ? P + '-math-block' : P + '-math-inline');
+        span.textContent = prettifyMath(tex);
+        frag.appendChild(span);
+        last = rx.lastIndex;
+      }
+      if (last < s.length) frag.appendChild(document.createTextNode(s.slice(last)));
+      node.parentNode.replaceChild(frag, node);
+    });
+  }
 
   // ── Element refs (scoped to the shadow root) ─────────────────────────────────
   const el = id => root.getElementById(id);
@@ -589,7 +921,9 @@
 
       const title = document.createElement('span');
       title.className = P + '-conv-title';
-      title.textContent = c.title || 'New chat';
+      // Prefer a real server (LLM) title; else the optimistic client title; else default.
+      const serverTitle = (c.title && c.title !== 'New chat') ? c.title : '';
+      title.textContent = serverTitle || state.localTitles[c.id] || 'New chat';
       li.appendChild(title);
 
       const del = document.createElement('button');
@@ -626,6 +960,7 @@
         { method: 'DELETE', headers: await authHeaders() });
     } catch (e) { /* best effort */ }
     state.conversations = state.conversations.filter(c => c.id !== id);
+    delete state.localTitles[id];
     renderConversations();
     if (state.activeConversationId === id) newChat();
   }
@@ -638,7 +973,9 @@
   }
 
   // ── Panel + sidebar open/close ───────────────────────────────────────────────
-  function openPanel()  { panel.classList.add('open');    toggleBtn.style.display = 'none'; }
+  // Warm up KaTeX on first open so the first formula answer typesets without a
+  // visible load delay (the promise is cached, so this runs at most once).
+  function openPanel()  { panel.classList.add('open');    toggleBtn.style.display = 'none'; ensureKatex().catch(() => {}); }
   function closePanel() { panel.classList.remove('open'); toggleBtn.style.display = ''; }
   function openSidebar()  { state.sidebarOpen = true;  sidebar.classList.add('open'); }
   function closeSidebar() { state.sidebarOpen = false; sidebar.classList.remove('open'); }
@@ -682,12 +1019,22 @@
     updateEmptyState();
     return div;
   }
-  function appendMessage(role, text, imgDataUrl) {
+  // Render a finished bot answer as formatted Markdown (vs. raw source text). User
+  // messages and errors stay as plain text — only the model's answer is markup.
+  function setBotHTML(div, text) {
+    div.classList.add(P + '-md');
+    div.innerHTML = renderMarkdown(text);
+    typesetMath(div);                 // KaTeX (or Unicode fallback) for any formulas
+  }
+  function appendMessage(role, text, imgDataUrl, opts) {
     const div = document.createElement('div');
     const roleClass = role === 'user' ? CLS.user : role === 'error' ? CLS.error : CLS.bot;
     div.className = CLS.msg + ' ' + roleClass;
     if (role === 'error') div.setAttribute('role', 'alert');   // assertive announce
-    div.textContent = text;
+    // `opts.raw` keeps the bubble plain text — used for the live streaming preview,
+    // which is re-rendered as Markdown once the authoritative final answer arrives.
+    if (role === 'bot' && !(opts && opts.raw)) setBotHTML(div, text);
+    else div.textContent = text;
     if (imgDataUrl) {
       const img = document.createElement('img');
       img.className = CLS.thumb; img.src = imgDataUrl;
@@ -724,35 +1071,129 @@
     setWaiting(true);
 
     const wasNew = !state.activeConversationId;
+    // Watchdog: abort a genuinely hung backend so the user gets a clear message
+    // instead of an indefinite spinner. Generous, because grounded answers from a
+    // CPU LLM can legitimately take a minute-plus; SSE keepalives hold the link.
+    const controller = new AbortController();
+    const watchdog = setTimeout(() => controller.abort(), 200000);  // 200s ceiling
     try {
       const body = { session_id: SESSION_ID, message: userText };
       if (state.activeConversationId) body.conversation_id = state.activeConversationId;
       if (att) { body.screenshot_base64 = att.base64; body.screenshot_mime = att.mime; }
 
-      const res = await fetch(cfg.apiBase + '/chat', {
-        method: 'POST',
-        headers: await authHeaders({ 'Content-Type': 'application/json' }),
-        body: JSON.stringify(body),
-      });
-      if (!res.ok) throw new Error('Server ' + res.status);
-      const data = await res.json();
-      typing.remove();
-      appendMessage('bot', data.answer);
+      // Stream via SSE so the connection produces bytes throughout the long answer
+      // (defeats the reverse-proxy idle timeout that surfaced as "something went
+      // wrong"). streamChat renders the bot bubble itself and returns the
+      // authoritative `final` payload (post output-guard).
+      const data = await streamChat(body, typing, controller.signal);
 
       if (data.conversation_id) state.activeConversationId = data.conversation_id;
-      // Authenticated + a brand-new conversation: refresh the sidebar so the
-      // background-generated short title shows up.
+      // Authenticated + a brand-new conversation: show an instant optimistic title
+      // (derived from the first message) so the row never reads "New chat", then
+      // refresh a couple of times to pick up the background LLM-generated title.
       if (state.authed && wasNew && data.conversation_id) {
-        setTimeout(loadConversations, 1200);
+        state.localTitles[data.conversation_id] = deriveTitle(userText);
+        if (!state.conversations.some(c => c.id === data.conversation_id)) {
+          state.conversations.unshift({ id: data.conversation_id, title: '' });
+        }
+        renderConversations();
+        setTimeout(loadConversations, 1500);   // pick up the LLM title when ready
+        setTimeout(loadConversations, 4000);
       }
     } catch (err) {
       typing.remove();
-      appendMessage('error', 'Sorry, something went wrong. Please try again.');
+      const timedOut = err && (err.name === 'AbortError' || controller.signal.aborted);
+      appendMessage('error', timedOut
+        ? 'The assistant is taking longer than usual. Please try again.'
+        : 'Sorry, something went wrong. Please try again.');
       if (window.console) console.warn('[chat-widget]', err);
     } finally {
+      clearTimeout(watchdog);
       setWaiting(false);
       clearAttachment();
     }
+  }
+
+  // ── Streaming transport (SSE) ────────────────────────────────────────────────
+  // Parse one SSE frame ("event:"/"data:"/comment lines) into {event, data}.
+  function parseSSEFrame(frame) {
+    let event = 'message';
+    const dataLines = [];
+    for (const raw of frame.split('\n')) {
+      const line = raw.replace(/\r$/, '');
+      if (!line || line[0] === ':') continue;            // blank / ": keepalive" comment
+      if (line.indexOf('event:') === 0) event = line.slice(6).trim();
+      else if (line.indexOf('data:') === 0) dataLines.push(line.slice(5).replace(/^ /, ''));
+    }
+    if (!dataLines.length) return { event, data: null };
+    try { return { event, data: JSON.parse(dataLines.join('\n')) }; }
+    catch (e) { return { event, data: null }; }
+  }
+
+  // POST /chat/stream and consume the SSE stream. Renders tokens live for
+  // responsiveness, then replaces them with the authoritative `final` answer
+  // (which has passed the server output guard). Falls back to blocking /chat when
+  // streaming is unavailable (older backend or no streaming body).
+  async function streamChat(body, typing, signal) {
+    let res;
+    try {
+      res = await fetch(cfg.apiBase + '/chat/stream', {
+        method: 'POST',
+        headers: await authHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify(body),
+        signal,
+      });
+    } catch (e) {
+      if (e && e.name === 'AbortError') throw e;
+      return blockingChat(body, typing, signal);         // couldn't reach the stream
+    }
+    if (res.status === 404) return blockingChat(body, typing, signal);  // endpoint absent
+    if (!res.ok || !res.body || !res.body.getReader) {
+      if (!res.body || !res.body.getReader) return blockingChat(body, typing, signal);
+      throw new Error('Server ' + res.status);
+    }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '', live = '', botDiv = null, final = null;
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let i;
+      while ((i = buf.indexOf('\n\n')) !== -1) {
+        const evt = parseSSEFrame(buf.slice(0, i));
+        buf = buf.slice(i + 2);
+        if (evt.event === 'token' && evt.data && evt.data.text != null) {
+          if (!botDiv) { typing.remove(); botDiv = appendMessage('bot', '', null, { raw: true }); }
+          live += evt.data.text;
+          botDiv.textContent = live;                     // grow the live preview (plain)
+          messages.scrollTop = messages.scrollHeight;
+        } else if (evt.event === 'final' && evt.data) {
+          final = evt.data;
+        }
+      }
+    }
+    if (!final) throw new Error('stream ended without a final event');
+    // The final payload is authoritative — it may differ from the streamed tokens
+    // (output guard can rewrite or refuse), so render it, not the preview.
+    if (botDiv) setBotHTML(botDiv, final.answer);
+    else { typing.remove(); appendMessage('bot', final.answer); }
+    return final;
+  }
+
+  async function blockingChat(body, typing, signal) {
+    const res = await fetch(cfg.apiBase + '/chat', {
+      method: 'POST',
+      headers: await authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify(body),
+      signal,
+    });
+    if (!res.ok) throw new Error('Server ' + res.status);
+    const data = await res.json();
+    typing.remove();
+    appendMessage('bot', data.answer);
+    return data;
   }
 
   // ── Screenshot capture (unchanged behaviour) ─────────────────────────────────

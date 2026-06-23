@@ -37,7 +37,7 @@
   const here = document.currentScript ? document.currentScript.src : '';
   const baseURL = here.replace(/mosdac-chat-widget\.js.*$/, '');
   const tag = document.createElement('script');
-  tag.src = baseURL + 'graph-rag-chat-widget.js';
+  tag.src = baseURL + 'graph-rag-chat-widget.js?v=2';   // bump ?v= when the widget changes (cache-bust)
   tag.async = false;
   document.head.appendChild(tag);
 })();

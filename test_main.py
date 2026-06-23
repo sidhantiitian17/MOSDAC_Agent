@@ -3,11 +3,22 @@
 Mirrors `main.py`, but instead of ingesting every file under DOWNLOADS_DIR/ATLASES_DIR
 it ingests exactly ONE configurable document and drives the whole production path:
 
-    Docling parse  →  Chroma vector DB  →  Neo4j knowledge graph  →  FastAPI RAG
+    Docling parse  →  content hash + manifest dedup  →  Chroma vector DB
+                  →  Neo4j knowledge graph  →  FastAPI RAG
 
 then leaves you a runbook for the browser-side checks (login → ask → persisted chat
 → username personalization) that can only be done by a human against Keycloak + the
 Drupal widget.
+
+WHAT THIS COVERS (every stage is asserted, not just smoke-run)
+    • Docling parse + FORMULA EXTRACTION  — the file is parsed via the real Docling
+      path; persisted chunks are scanned for LaTeX ($$…$$) and structured markdown.
+    • CONTENT HASHING + MANIFEST DEDUP    — the SHA-256 content hash is computed,
+      the file is ingested through IngestionPipeline.run() (NOT run_on_documents, so
+      the manifest path is exercised), the manifest is asserted to record the hash,
+      and a second run() is asserted to SKIP the unchanged file (dedup proven).
+    • Chunk → embed → Chroma + entity/relationship/measurement → Neo4j.
+    • Live FastAPI RAG endpoints (/health, /ready, /config, /me, /chat, auth flow).
 
 ──────────────────────────────────────────────────────────────────────────────
 WHICH FILE (configurable via .env)
@@ -216,11 +227,34 @@ def reset_stores(assume_yes: bool) -> None:
     ok("Neo4j graph cleared")
 
 
-# ── Phase 1: ingest the single file through the real pipeline ─────────────────
+# ── Phase 1: ingest the single file through the REAL full pipeline ────────────
+def _stage_single_file(target: Path, root: Path) -> Path:
+    """Place exactly `target` inside an isolated `<root>/atlases_pdfs/` folder.
+
+    Two reasons for the `atlases_pdfs` name: (1) it keeps Docling's
+    `_should_force_full_page_ocr()` rule active (it matches the substring
+    `atlases_pdfs` anywhere in the path), so an atlas is OCR'd exactly as in
+    production; (2) an isolated folder guarantees `run()`'s file discovery finds
+    ONLY this one file. Prefer a symlink (no copy of a large PDF); fall back to a
+    real copy where symlinks are unavailable.
+    """
+    stage_dir = root / "atlases_pdfs"
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    link = stage_dir / target.name
+    try:
+        link.symlink_to(target.resolve())
+    except (OSError, NotImplementedError):
+        import shutil
+        shutil.copy2(target, link)
+    return stage_dir
+
+
 def phase_ingest(target: Path) -> dict:
-    banner("PHASE 1 — INGEST ONE FILE (Docling → Chroma → Neo4j)")
+    banner("PHASE 1 — INGEST ONE FILE (Docling → hashing/manifest → Chroma → Neo4j)")
+    import tempfile
+    from graph_rag.config import settings
     from graph_rag.embeddings import get_embedder
-    from graph_rag.ingestion.loader import load_file
+    from graph_rag.ingestion.manifest import IngestionManifest, compute_file_hash
     from graph_rag.ingestion.pipeline import IngestionPipeline
     from graph_rag.knowledge_graph.neo4j_store import Neo4jStore
     from graph_rag.vector_store.chroma_store import ChromaStore
@@ -230,29 +264,116 @@ def phase_ingest(target: Path) -> dict:
         before_graph = neo.schema_report()
     info(f"before — chroma chunks={before_chroma}  graph={before_graph}")
 
-    t0 = time.monotonic()
-    log.info("Loading + Docling-parsing %s …", target.name)
-    docs = load_file(target)          # ← real Docling parse + preprocess + enrich
-    if not docs:
-        raise PhaseError(f"load_file produced 0 documents for {target} — parser/quality gate rejected it.")
-    ok(f"Docling produced {len(docs)} pre-chunked document(s) in {time.monotonic() - t0:.0f}s")
+    # ── HASHING (1/3): compute the file's SHA-256 content hash ────────────────
+    file_hash = compute_file_hash(target)
+    ok(f"content hash (SHA-256): {file_hash[:16]}…  ({target.name})")
 
-    # run_on_documents = split → embed(Chroma) → extract(Neo4j); bypasses the
-    # file-discovery + manifest (so this single file is always (re)ingested).
-    stats = IngestionPipeline().run_on_documents(docs)
-    print("\n" + stats.summary())
+    # Drive ingestion through a FRESH temp manifest so the dedup assertion is
+    # deterministic on every run (a clean manifest always re-ingests this file,
+    # then the in-test second run proves the skip). Restored in `finally`.
+    orig_manifest_path = settings.ingest_manifest_path
+    tmp = tempfile.mkdtemp(prefix="e2e_ingest_")
+    tmp_root = Path(tmp)
+    tmp_manifest = tmp_root / "ingest_manifest.json"
+    try:
+        settings.ingest_manifest_path = str(tmp_manifest)
+        if IngestionManifest.load(tmp_manifest).is_ingested(file_hash):
+            raise PhaseError("fresh temp manifest unexpectedly already contains the file hash.")
+        ok("fresh manifest: file not yet ingested (is_ingested=False)")
 
-    if stats.errors:
-        for e in stats.errors:
-            bad(f"pipeline error: {e}")
-        raise PhaseError("Ingestion reported errors — vector and/or graph write failed.")
-    if stats.chunks_indexed <= 0 and stats.chunks_created > 0:
-        # Idempotent path: chunks already present from a prior run (dedup by chunk_id).
-        warn("0 new chunks indexed — already present from a prior run. Use --reset for a clean corpus.")
-    ok(f"ingest OK: loaded={stats.documents_loaded} chunks={stats.chunks_created} "
-       f"indexed={stats.chunks_indexed} entities={stats.entities_created} "
-       f"rels={stats.relationships_created} backend={stats.extraction_backend}")
+        stage_dir = _stage_single_file(target, tmp_root)
+        info(f"staged single file under {stage_dir} (force-OCR rule preserved)")
+
+        # run() = discover (hash + skip) → split → embed(Chroma) → extract(Neo4j)
+        #         → record + save manifest. The full production path, one file.
+        t0 = time.monotonic()
+        log.info("Ingesting %s via IngestionPipeline.run() …", target.name)
+        stats1 = IngestionPipeline(folders=[stage_dir]).run()
+        print("\n" + stats1.summary())
+        if stats1.errors:
+            for e in stats1.errors:
+                bad(f"pipeline error: {e}")
+            raise PhaseError("Ingestion reported errors — vector and/or graph write failed.")
+        if stats1.documents_loaded < 1:
+            raise PhaseError("run() loaded 0 documents — parser/quality gate rejected the file.")
+        if stats1.chunks_indexed <= 0 and stats1.chunks_created > 0:
+            # Chunk-level idempotency: identical chunk_ids already in Chroma from a
+            # prior corpus. The manifest dedup below is the authoritative check.
+            warn("0 new chunks indexed — identical chunk_ids already in Chroma (use --reset for a clean corpus).")
+        ok(f"ingest OK in {time.monotonic() - t0:.0f}s: loaded={stats1.documents_loaded} "
+           f"chunks={stats1.chunks_created} indexed={stats1.chunks_indexed} "
+           f"entities={stats1.entities_created} rels={stats1.relationships_created} "
+           f"backend={stats1.extraction_backend}")
+
+        # ── HASHING (2/3): the manifest now records this file by content hash ──
+        if not IngestionManifest.load(tmp_manifest).is_ingested(file_hash):
+            raise PhaseError("manifest did not record the file hash after a clean run.")
+        ok("manifest recorded the file by content hash (is_ingested=True)")
+
+        # ── HASHING (3/3): re-run proves dedup — unchanged hash → skipped ─────
+        stats2 = IngestionPipeline(folders=[stage_dir]).run()
+        if stats2.documents_loaded != 0:
+            raise PhaseError(
+                f"dedup failed: re-run loaded {stats2.documents_loaded} document(s); "
+                f"the unchanged file should have been skipped by content hash.")
+        ok("re-ingest skipped the unchanged file (dedup by content hash verified)")
+
+        _assert_formula_extraction(target, file_hash)
+    finally:
+        settings.ingest_manifest_path = orig_manifest_path
+        import shutil
+        shutil.rmtree(tmp_root, ignore_errors=True)
+
     return {"before_chroma": before_chroma, "before_graph": before_graph}
+
+
+def _assert_formula_extraction(target: Path, file_hash: str) -> None:
+    """Confirm Docling ran (structured markdown) and surface formula extraction.
+
+    Reads the persisted Chroma chunks for this file (no re-parse) and checks TWO
+    signals: (1) the preprocessor's canonical `has_formula`/`has_table` metadata
+    flags, and (2) raw LaTeX (`$$…$$`) / table-pipe / heading markers in the text.
+    Formula presence is a SOFT check (warn, not fail) — an image-heavy atlas can
+    legitimately contain no equations. A total absence of BOTH formulas AND tables
+    AND headings is the real red flag (suggests the pypdf/OCR text fallback ran
+    instead of Docling), so that is surfaced loudly.
+    """
+    from graph_rag.embeddings import get_embedder
+    from graph_rag.vector_store.chroma_store import ChromaStore
+
+    raw = ChromaStore(embedder=get_embedder()).get_all_chunks()
+    docs = raw.get("documents") or []
+    metas = raw.get("metadatas") or []
+    pairs = [
+        (d, m or {}) for d, m in zip(docs, metas)
+        if (m or {}).get("file_hash") == file_hash
+        or target.name in ((m or {}).get("source", "") + (m or {}).get("file_name", ""))
+    ]
+    if not pairs:  # fall back to the whole collection if metadata didn't match
+        pairs = [(d, m or {}) for d, m in zip(docs, metas)]
+
+    formula_meta = sum(1 for _, m in pairs if m.get("has_formula"))
+    table_meta = sum(1 for _, m in pairs if m.get("has_table"))
+    formula_text = sum(1 for d, _ in pairs if d and "$$" in d)
+    structured = sum(1 for d, _ in pairs if d and ("|" in d or d.lstrip().startswith("#")))
+
+    info(f"formula scan over {len(pairs)} chunk(s) matched to {target.name}")
+    if formula_meta or formula_text:
+        ok(f"Docling formula extraction present: has_formula={formula_meta} chunk(s), "
+           f"$$…$$ in text={formula_text} chunk(s)")
+    else:
+        warn(f"no formulas detected (has_formula={formula_meta}, $$ in text={formula_text}) — "
+             f"this document may simply contain none. (Soft check; not a failure.)")
+
+    if table_meta or structured:
+        ok(f"Docling structured output confirmed: has_table={table_meta} chunk(s), "
+           f"table/heading markers in {structured} chunk(s)")
+    else:
+        # No formulas AND no tables AND no headings → almost certainly not Docling.
+        raise PhaseError(
+            "No structured markdown (tables/headings) and no formulas in any chunk — "
+            "Docling likely did NOT run (pypdf/OCR text fallback). Verify USE_DOCLING=true "
+            "and that Docling models are available.")
 
 
 # ── Phase 2: verify the stores actually hold this file's content ──────────────

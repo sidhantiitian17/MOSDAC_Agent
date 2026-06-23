@@ -44,6 +44,8 @@ eval_runs/
 eval_results.md
 models_cache/
 models--*/
+venv/
+
 
 # Tests & docs are not needed in the runtime image
 tests/

@@ -117,6 +117,11 @@ services:
       # and immediately drops to appuser via gosu — only the chown runs as root.)
       - ./chroma_db:/app/chroma_db
       - ./prompts:/app/prompts
+      # Serve the widget + vendored assets (KaTeX) from the host dir so front-end
+      # edits take effect on `up -d` without a full image rebuild. The image still
+      # bakes static/ via COPY (line 47, Dockerfile.api) as the fallback for
+      # deployments without the repo on disk; this mount just shadows it with live files.
+      - ./static:/app/static:ro
       # Durable, writable SQLite store for per-user history (named volume, owned by
       # the non-root appuser). Matches CHAT_API_SQLITE_PATH=/app/data/... in the image.
       - conv_data:/app/data

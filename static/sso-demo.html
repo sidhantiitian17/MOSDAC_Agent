@@ -76,7 +76,7 @@
         // loginUrl as a function → the widget calls it; keycloak-js does the redirect.
         loginUrl: () => kc.login({ redirectUri: location.href }),
       };
-      loadScript('/static/graph-rag-chat-widget.js');
+      loadScript('/static/graph-rag-chat-widget.js?v=2');   // bump ?v= when the widget changes (cache-bust)
     }
 
     (async function () {
